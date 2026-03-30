@@ -1,0 +1,29 @@
+FROM rust:1.94.0-bookworm AS builder
+
+WORKDIR /app
+
+RUN rustup target add wasm32-unknown-unknown
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY src ./src
+COPY mitb-av ./mitb-av
+COPY mitb-box ./mitb-box
+COPY mitb-host ./mitb-host
+COPY mitb-pake ./mitb-pake
+COPY mitb-sdk ./mitb-sdk
+COPY mitb-server ./mitb-server
+COPY mitb-wit ./mitb-wit
+
+RUN cargo build --locked --release -p mitb-server
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+WORKDIR /app
+ENV MITB_ALLOW_AGENT_ROOM_CREATION=true
+ENV MITB_SERVER_THREADS=1
+
+COPY --from=builder /app/target/release/mitb-server /app/mitb-server
+
+EXPOSE 3000
+
+ENTRYPOINT ["/app/mitb-server"]

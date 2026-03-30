@@ -1,0 +1,16 @@
+[package]
+name = "maintainability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wit-bindgen.workspace = true
+mitb-sdk.workspace = true
+
+[build-dependencies]
+mitb-sdk = { workspace = true, features = ["build-support"] }
+
+[lib]
+crate-type = ["cdylib"]

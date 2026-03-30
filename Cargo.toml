@@ -1,0 +1,45 @@
+[package]
+name = "mitb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+clap = "4.6.0"
+mitb-box = { path = "./mitb-box" }
+mitb-host = { path = "./mitb-host" }
+thiserror = "2.0.18"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+
+[workspace]
+resolver = "2"
+members = [
+    "mitb-av",
+    "mitb-box",
+    "mitb-host",
+    "mitb-pake",
+    "mitb-server",
+    "mitb-sdk",
+    "mitb-wit",
+]
+exclude = ["mitb-examples/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

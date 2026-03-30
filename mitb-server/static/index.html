@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Man in the Box</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPSc2NCcgaGVpZ2h0PSc2NCcgdmlld0JveD0nMCAwIDY0IDY0Jz48cmVjdCB3aWR0aD0nNjQnIGhlaWdodD0nNjQnIGZpbGw9JyMwYjBiMGInLz48cmVjdCB4PSc4JyB5PSc4JyB3aWR0aD0nNDgnIGhlaWdodD0nNDgnIGZpbGw9J25vbmUnIHN0cm9rZT0nI2ZmZmZmZicgc3Ryb2tlLXdpZHRoPScyLjgnIHJ4PScxLjUnLz48cGF0aCBmaWxsPSdub25lJyBzdHJva2U9JyNmZmZmZmYnIHN0cm9rZS13aWR0aD0nMicgZD0nTTE1IDM0IFEzMiAyMyA0OSAzNCcvPjxwYXRoIGZpbGw9J25vbmUnIHN0cm9rZT0nI2ZmZmZmZicgc3Ryb2tlLXdpZHRoPScyJyBkPSdNMTUgMzQgUTMyIDQ1IDQ5IDM0Jy8+PHBhdGggc3Ryb2tlPScjZmZmZmZmJyBzdHJva2Utd2lkdGg9JzIuMicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBkPSdNMTkgMzQgSDQ1Jy8+PHBhdGggc3Ryb2tlPScjZmZmZmZmJyBzdHJva2Utd2lkdGg9JzEuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBkPSdNMjIgMzAgTDIwIDM4IE0yNiAzMCBMMjQgMzggTTMwIDMwIEwyOCAzOCBNMzQgMzAgTDM2IDM4IE0zOCAzMCBMNDAgMzggTTQyIDMwIEw0NCAzOCcvPjwvc3ZnPgo="
+    />
+  </head>
+  <body>
+    <main>
+      <h1>Man in the Box</h1>
+
+      <div id="connect-controls">
+        <label>
+          SECRET CODE
+          <input
+            id="secret-code"
+            name="secret_code"
+            type="password"
+            autocomplete="current-password"
+            placeholder="secret code"
+          />
+        </label>
+        <button id="connect">Connect</button>
+      </div>
+
+      <p id="status">Disconnected.</p>
+      <div id="agents"></div>
+      <pre id="log"></pre>
+    </main>
+
+    <script>
+      const statusEl = document.querySelector("#status");
+      const logEl = document.querySelector("#log");
+      const agentsEl = document.querySelector("#agents");
+      const secretCodeEl = document.querySelector("#secret-code");
+      const connectButton = document.querySelector("#connect");
+      const rtcConfiguration = {
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      };
+
+      let socket = null;
+      let authState = null;
+      const peers = new Map();
+      const logEntries = [];
+      let pakeBridgePromise = null;
+
+      function logLine(line) {
+        logEntries.unshift(line);
+        logEl.textContent = logEntries.join("\n");
+        logEl.scrollTop = 0;
+      }
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function setConnectionUi(connected) {
+        secretCodeEl.disabled = connected;
+        connectButton.textContent = connected ? "Disconnect" : "Connect";
+      }
+
+      async function getPakeBridge() {
+        if (!pakeBridgePromise) {
+          pakeBridgePromise = (async () => {
+            const imports = {
+              env: {
+                mitb_fill_random(ptr, len) {
+                  const target = new Uint8Array(
+                    result.instance.exports.memory.buffer,
+                    ptr,
+                    len
+                  );
+                  globalThis.crypto.getRandomValues(target);
+                  return 0;
+                },
+              },
+            };
+            let result;
+            try {
+              result = await WebAssembly.instantiateStreaming(
+                fetch("/assets/mitb-pake.wasm"),
+                imports
+              );
+            } catch (_) {
+              const response = await fetch("/assets/mitb-pake.wasm");
+              const bytes = await response.arrayBuffer();
+              result = await WebAssembly.instantiate(bytes, imports);
+            }
+
+            const exports = result.instance.exports;
+            const encoder = new TextEncoder();
+            const decoder = new TextDecoder();
+
+            function call(request) {
+              const input = encoder.encode(JSON.stringify(request));
+              const inputPtr = exports.mitb_pake_alloc(input.length);
+              new Uint8Array(exports.memory.buffer, inputPtr, input.length).set(
+                input
+              );
+              const outputPtr = exports.mitb_pake_process_json(
+                inputPtr,
+                input.length
+              );
+              exports.mitb_pake_free(inputPtr, input.length);
+
+              const outputLen = exports.mitb_pake_last_result_len();
+              const output = new Uint8Array(
+                exports.memory.buffer,
+                outputPtr,
+                outputLen
+              ).slice();
+              exports.mitb_pake_free(outputPtr, outputLen);
+
+              const response = JSON.parse(decoder.decode(output));
+              if (!response.ok) {
+                throw new Error(response.error || "PAKE operation failed");
+              }
+              return response;
+            }
+
+            return {
+              create(secretCode) {
+                return call({ type: "create", secret_code: secretCode });
+              },
+              destroy(handle) {
+                return call({ type: "destroy", handle });
+              },
+              startLogin(handle) {
+                return call({ type: "start_login", handle });
+              },
+              startRegistration(handle) {
+                return call({ type: "start_registration", handle });
+              },
+              finishRegistration(handle, registrationResponse) {
+                return call({
+                  type: "finish_registration",
+                  handle,
+                  registration_response: registrationResponse,
+                });
+              },
+              finishLogin(handle, credentialResponse) {
+                return call({
+                  type: "finish_login",
+                  handle,
+                  credential_response: credentialResponse,
+                });
+              },
+            };
+          })();
+        }
+
+        return pakeBridgePromise;
+      }
+
+      async function clearAuthState() {
+        if (!authState) {
+          return;
+        }
+
+        const { pake, handle } = authState;
+        authState = null;
+        try {
+          pake.destroy(handle);
+        } catch (_) {
+          // Ignore teardown failures after disconnect.
+        }
+      }
+
+      function renderAgents() {
+        agentsEl.replaceChildren();
+        for (const agentId of Array.from(peers.keys()).sort()) {
+          const peer = peers.get(agentId);
+          const card = document.createElement("div");
+          const label = document.createElement("strong");
+          label.textContent = `${agentId} (${peer.connectionState})`;
+
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = "Kill";
+          button.disabled =
+            peer.dataChannel === null ||
+            peer.connectionState !== "connected" ||
+            peer.dataChannelState !== "open";
+          button.addEventListener("click", () => {
+            if (!peer.dataChannel || peer.dataChannel.readyState !== "open") {
+              return;
+            }
+            peer.dataChannel.send(JSON.stringify({ type: "terminate" }));
+          });
+
+          card.append(label, button);
+          agentsEl.append(card);
+        }
+      }
+
+      function rememberAgent(agentId) {
+        if (!peers.has(agentId)) {
+          peers.set(agentId, {
+            connection: null,
+            dataChannel: null,
+            connectionState: "new",
+            dataChannelState: "waiting",
+          });
+        }
+        renderAgents();
+      }
+
+      function forgetAgent(agentId) {
+        const peer = peers.get(agentId);
+        if (peer && peer.connection) {
+          peer.connection.close();
+        }
+        peers.delete(agentId);
+        renderAgents();
+      }
+
+      function sendSignal(peerId, payload) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+
+        socket.send(JSON.stringify({
+          type: "signal",
+          peer_id: peerId,
+          payload,
+        }));
+      }
+
+      function formatTimestamp(date = new Date()) {
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        const hours = String(date.getHours()).padStart(2, "0");
+        const minutes = String(date.getMinutes()).padStart(2, "0");
+        return `${month}-${day} ${hours}:${minutes}`;
+      }
+
+      async function deriveRoomHandle(secretCode) {
+        const bytes = new TextEncoder().encode(secretCode);
+        if (!globalThis.crypto || !globalThis.crypto.subtle) {
+          throw new Error("WebCrypto unavailable (requires a secure context)");
+        }
+        const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+        const hash = Array.from(new Uint8Array(digest))
+          .slice(0, 12)
+          .map((value) => value.toString(16).padStart(2, "0"))
+          .join("");
+        return `room-${hash}`;
+      }
+
+      function configureDataChannel(agentId, dataChannel) {
+        const peer = peers.get(agentId);
+        if (!peer) {
+          return;
+        }
+
+        peer.dataChannel = dataChannel;
+        peer.dataChannelState = dataChannel.readyState;
+        renderAgents();
+
+        dataChannel.addEventListener("open", () => {
+          peer.dataChannelState = dataChannel.readyState;
+          logLine(`[data_open] ${agentId}`);
+          renderAgents();
+        });
+
+        dataChannel.addEventListener("close", () => {
+          peer.dataChannelState = dataChannel.readyState;
+          logLine(`[data_close] ${agentId}`);
+          renderAgents();
+        });
+
+        dataChannel.addEventListener("message", (event) => {
+          const renderBytes = async (value) => {
+            if (typeof value === "string") {
+              return value;
+            }
+
+            if (value instanceof ArrayBuffer) {
+              return new TextDecoder().decode(new Uint8Array(value));
+            }
+
+            if (ArrayBuffer.isView(value)) {
+              return new TextDecoder().decode(
+                new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+              );
+            }
+
+            if (value instanceof Blob) {
+              const buffer = await value.arrayBuffer();
+              return new TextDecoder().decode(new Uint8Array(buffer));
+            }
+
+            return String(value);
+          };
+
+          void renderBytes(event.data)
+            .then((text) => {
+              try {
+                const payload = JSON.parse(text);
+                if (
+                  payload &&
+                  payload.type === "reward" &&
+                  Number.isFinite(payload.reward)
+                ) {
+                  logLine(
+                    `[${formatTimestamp()}][${agentId}] reward ${payload.reward.toFixed(6)}`
+                  );
+                  return;
+                }
+              } catch (_) {}
+              logLine(`[${formatTimestamp()}][${agentId}] ${text}`);
+            })
+            .catch((error) => {
+              logLine(`[peer_decode_error][${agentId}] ${error}`);
+            });
+        });
+      }
+
+      function ensurePeer(agentId) {
+        rememberAgent(agentId);
+        const existing = peers.get(agentId);
+        if (existing.connection) {
+          return existing.connection;
+        }
+
+        const connection = new RTCPeerConnection(rtcConfiguration);
+        existing.connection = connection;
+        existing.connectionState = connection.connectionState;
+
+        connection.addEventListener("icecandidate", (event) => {
+          if (!event.candidate) {
+            logLine(`[gathering_complete] ${agentId}`);
+          }
+        });
+
+        connection.addEventListener("connectionstatechange", () => {
+          existing.connectionState = connection.connectionState;
+          renderAgents();
+        });
+
+        connection.addEventListener("datachannel", (event) => {
+          configureDataChannel(agentId, event.channel);
+        });
+
+        renderAgents();
+        return connection;
+      }
+
+      async function handleSignal(agentId, payload) {
+        const connection = ensurePeer(agentId);
+
+        if (payload.type === "offer") {
+          await connection.setRemoteDescription({
+            type: "offer",
+            sdp: payload.sdp,
+          });
+          const answer = await connection.createAnswer();
+          await connection.setLocalDescription(answer);
+          if (connection.iceGatheringState !== "complete") {
+            await new Promise((resolve) => {
+              const listener = () => {
+                if (connection.iceGatheringState === "complete") {
+                  connection.removeEventListener(
+                    "icegatheringstatechange",
+                    listener
+                  );
+                  resolve();
+                }
+              };
+              connection.addEventListener("icegatheringstatechange", listener);
+            });
+          }
+          sendSignal(agentId, {
+            type: "answer",
+            sdp: connection.localDescription.sdp,
+          });
+          return;
+        }
+
+        if (payload.type === "answer") {
+          await connection.setRemoteDescription({
+            type: "answer",
+            sdp: payload.sdp,
+          });
+          return;
+        }
+
+      }
+
+      async function handleServerMessage(message) {
+        switch (message.type) {
+          case "pake_registration_required":
+          case "pake_registration_response":
+          case "pake_credential_candidates":
+            logLine(`[server] unexpected auth message after connect`);
+            break;
+          case "connected":
+            setStatus(`Connected as ${message.client_id}.`);
+            message.agents.forEach(rememberAgent);
+            break;
+          case "peer_joined":
+            if (message.role === "agent") {
+              rememberAgent(message.client_id);
+            }
+            logLine(`[peer_joined] ${message.role} ${message.client_id}`);
+            break;
+          case "peer_left":
+            if (message.role === "agent") {
+              forgetAgent(message.client_id);
+            }
+            logLine(`[peer_left] ${message.role} ${message.client_id}`);
+            break;
+          case "signal":
+            try {
+              await handleSignal(message.peer_id, message.payload);
+            } catch (error) {
+              logLine(`[signal_error][${message.peer_id}] ${error}`);
+            }
+            break;
+          case "error":
+            logLine(`[error] ${message.message}`);
+            break;
+          case "pong":
+            logLine("[pong]");
+            break;
+          default:
+            logLine(`[server] ${JSON.stringify(message)}`);
+            break;
+        }
+      }
+
+      async function beginAuthentication(secretCode) {
+        const pake = await getPakeBridge();
+        const created = pake.create(secretCode);
+        const roomHandle = await deriveRoomHandle(secretCode);
+        authState = {
+          pake,
+          handle: created.handle,
+        };
+
+        const login = pake.startLogin(created.handle);
+        socket.send(
+          JSON.stringify({
+            type: "pake_init",
+            role: "zookeeper",
+            room_handle: roomHandle,
+            credential_request: login.credential_request,
+          })
+        );
+      }
+
+      function selectLoginCandidate(candidates) {
+        let lastError = null;
+
+        for (const candidate of candidates) {
+          try {
+            const login = authState.pake.finishLogin(
+              authState.handle,
+              candidate.credential_response
+            );
+            return {
+              candidateId: candidate.candidate_id,
+              credentialFinalization: login.credential_finalization,
+            };
+          } catch (error) {
+            lastError = error;
+          }
+        }
+
+        throw lastError || new Error("unknown secret code");
+      }
+
+      async function handleAuthMessage(message) {
+        if (!authState) {
+          return;
+        }
+
+        switch (message.type) {
+          case "pake_registration_required": {
+            const registration = authState.pake.startRegistration(authState.handle);
+            socket.send(
+              JSON.stringify({
+                type: "pake_registration_request",
+                registration_request: registration.registration_request,
+              })
+            );
+            return;
+          }
+          case "pake_registration_response": {
+            const registration = authState.pake.finishRegistration(
+              authState.handle,
+              message.registration_response
+            );
+            socket.send(
+              JSON.stringify({
+                type: "pake_registration_upload",
+                registration_upload: registration.registration_upload,
+                credential_request: registration.credential_request,
+              })
+            );
+            return;
+          }
+          case "pake_credential_candidates": {
+            const login = selectLoginCandidate(message.candidates);
+            socket.send(
+              JSON.stringify({
+                type: "pake_credential_finalization",
+                candidate_id: login.candidateId,
+                credential_finalization: login.credentialFinalization,
+              })
+            );
+            return;
+          }
+          case "connected":
+            await clearAuthState();
+            await handleServerMessage(message);
+            return;
+          case "error":
+            logLine(`[error] ${message.message}`);
+            if (socket) {
+              socket.close();
+            }
+            return;
+          default:
+            logLine(`[auth_error] unexpected message ${JSON.stringify(message)}`);
+            if (socket) {
+              socket.close();
+            }
+        }
+      }
+
+      async function connect() {
+        const secretCode = secretCodeEl.value.trim();
+        if (!secretCode) {
+          setStatus("Enter a SECRET CODE first.");
+          return;
+        }
+
+        if (socket) {
+          socket.close();
+        }
+
+        for (const agentId of Array.from(peers.keys())) {
+          forgetAgent(agentId);
+        }
+        renderAgents();
+        logEntries.length = 0;
+        logEl.textContent = "";
+
+        const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+        socket = new WebSocket(`${wsProtocol}://${window.location.host}/ws`);
+        setStatus("Connecting...");
+        setConnectionUi(true);
+
+        socket.addEventListener("open", () => {
+          void beginAuthentication(secretCode).catch((error) => {
+            logLine(`[auth_error] ${error}`);
+            setStatus("Connection failed.");
+            if (socket) {
+              socket.close();
+            }
+          });
+        });
+
+        socket.addEventListener("message", (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            if (authState) {
+              void handleAuthMessage(message);
+              return;
+            }
+            void handleServerMessage(message);
+          } catch (error) {
+            logLine(`[parse_error] ${error}`);
+          }
+        });
+
+        socket.addEventListener("close", () => {
+          void clearAuthState();
+          socket = null;
+          setStatus("Disconnected.");
+          setConnectionUi(false);
+          for (const agentId of Array.from(peers.keys())) {
+            forgetAgent(agentId);
+          }
+        });
+
+        socket.addEventListener("error", () => {
+          setStatus("Connection failed.");
+        });
+      }
+
+      connectButton.addEventListener("click", () => {
+        if (socket) {
+          socket.close();
+          return;
+        }
+
+        connect();
+      });
+      secretCodeEl.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          connect();
+        }
+      });
+    </script>
+  </body>
+</html>

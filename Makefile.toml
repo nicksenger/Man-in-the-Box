@@ -1,0 +1,81 @@
+[config]
+default_to_workspace = false
+
+[tasks.build-wasm]
+command = "cargo"
+args = [
+  "build",
+  "--manifest-path",
+  "mitb-examples/Cargo.toml",
+  "--release",
+  "--target=wasm32-unknown-unknown",
+]
+
+[tasks.adapt-always-wait]
+command = "wasm-tools"
+args = [
+  "component",
+  "new",
+  "mitb-examples/target/wasm32-unknown-unknown/release/always_wait.wasm",
+  "-o",
+  "mitb-examples/target/always_wait.component.wasm",
+  "--adapt",
+  "wasi_snapshot_preview1=mitb-examples/wasi_snapshot_preview1.reactor.wasm",
+]
+
+[tasks.adapt-number-game]
+command = "wasm-tools"
+args = [
+  "component",
+  "new",
+  "mitb-examples/target/wasm32-unknown-unknown/release/number_game.wasm",
+  "-o",
+  "mitb-examples/target/number_game.component.wasm",
+  "--adapt",
+  "wasi_snapshot_preview1=mitb-examples/wasi_snapshot_preview1.reactor.wasm",
+]
+
+[tasks.adapt-maintainability]
+command = "wasm-tools"
+args = [
+  "component",
+  "new",
+  "mitb-examples/target/wasm32-unknown-unknown/release/maintainability.wasm",
+  "-o",
+  "mitb-examples/target/maintainability.component.wasm",
+  "--adapt",
+  "wasi_snapshot_preview1=mitb-examples/wasi_snapshot_preview1.reactor.wasm",
+]
+
+[tasks.component-treesitter-provider]
+command = "wasm-tools"
+args = [
+  "component",
+  "new",
+  "mitb-examples/target/wasm32-unknown-unknown/release/treesitter_provider.wasm",
+  "-o",
+  "mitb-examples/target/treesitter-provider-component.wasm",
+]
+
+[tasks.compose-maintainability]
+command = "wasm-tools"
+args = [
+  "compose",
+  "mitb-examples/target/maintainability.component.wasm",
+  "-d",
+  "mitb-examples/target/treesitter-provider-component.wasm",
+  "-o",
+  "mitb-examples/target/maintainability.composed.component.wasm",
+]
+
+[tasks.adapt]
+dependencies = [
+  "adapt-always-wait",
+  "adapt-maintainability",
+  "adapt-number-game",
+  "component-treesitter-provider",
+  "compose-maintainability",
+]
+
+[tasks.wasm]
+dependencies = ["build-wasm", "adapt"]

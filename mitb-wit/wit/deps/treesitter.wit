@@ -1,0 +1,51 @@
+package mitb:treesitter@0.1.0;
+
+interface api {
+    record point {
+        row: u32,
+        column: u32,
+    }
+
+    record span {
+        start-byte: u32,
+        end-byte: u32,
+        start: point,
+        end: point,
+    }
+
+    record capture {
+        name: string,
+        span: span,
+        text: string,
+    }
+
+    record query-match {
+        pattern-index: u32,
+        captures: list<capture>,
+    }
+
+    enum parse-error {
+        unsupported-language,
+        parse-failed,
+        internal,
+    }
+
+    enum query-error {
+        unsupported-language,
+        invalid-query,
+        unknown-tree,
+        unknown-query,
+        internal,
+    }
+
+    list-languages: func() -> list<string>;
+    parse: func(language: string, source: string) -> result<u32, parse-error>;
+    query-compile: func(language: string, query: string) -> result<u32, query-error>;
+    query-exec: func(query-id: u32, tree-id: u32, source: string, limit: option<u32>) -> result<list<query-match>, query-error>;
+    drop-tree: func(tree-id: u32);
+    drop-query: func(query-id: u32);
+}
+
+world provider {
+    export api;
+}

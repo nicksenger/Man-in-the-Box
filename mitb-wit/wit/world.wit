@@ -1,0 +1,135 @@
+package mitb:host@0.1.0;
+
+/// Types shared between host and guest.
+interface types {
+    enum key {
+        enter,
+        tab,
+        backspace,
+        escape,
+        arrow-up,
+        arrow-down,
+        arrow-left,
+        arrow-right,
+        ctrl-c,
+        ctrl-d,
+    }
+
+    variant input {
+        text(string),
+        key(key),
+    }
+
+    variant action {
+        perturb(list<input>),
+        wait,
+    }
+
+    enum spawn-error-kind {
+        invalid-command,
+        not-found,
+        permission-denied,
+        io,
+        other,
+    }
+
+    record spawn-error {
+        kind: spawn-error-kind,
+        message: string,
+    }
+
+    record exit-status {
+        success: bool,
+        code: option<u32>,
+    }
+}
+
+/// Guest policy functions called by the host.
+interface policy-api {
+    use types.{action};
+
+    resource session {
+        constructor();
+
+        /// Returns the next action for the host to perform.
+        poll: async func() -> result<action, string>;
+    }
+}
+
+/// Host terminal access available to policy modules.
+interface terminal {
+    /// Monotonic byte cursor for the latest terminal output position.
+    head: func() -> u64;
+
+    /// Return a transcript snapshot capped at `max-bytes`.
+    snapshot: async func(max-bytes: u32) -> result<list<u8>, string>;
+
+    /// Return transcript bytes since `cursor`, capped at `max-bytes`.
+    ///
+    /// Returns the next cursor alongside the bytes.
+    /// If retained transcript no longer includes `cursor`, the next cursor
+    /// may advance beyond `cursor`.
+    read-since: async func(cursor: u64, max-bytes: u32) -> result<tuple<u64, list<u8>>, string>;
+}
+
+/// Host utilities available to policy modules.
+interface process {
+    use types.{exit-status, spawn-error};
+
+    resource child {
+        /// Write data to the child's stdin.
+        write-stdin: async func(data: stream<u8>) -> result<_, string>;
+
+        /// Read bytes from the child's stdout.
+        read-stdout: async func() -> tuple<stream<u8>, future<result<_, string>>>;
+
+        /// Read bytes from the child's stderr.
+        read-stderr: async func() -> tuple<stream<u8>, future<result<_, string>>>;
+
+        /// Wait for the child process to exit.
+        wait: async func() -> result<exit-status, string>;
+
+        /// Wait for the child process to exit, returning `none` on timeout.
+        wait-timeout: async func(timeout-ns: u64) -> result<option<exit-status>, string>;
+
+        /// Kill the child process.
+        kill: async func() -> result<_, string>;
+    }
+
+    /// Spawn a child process with piped stdio.
+    spawn: async func(name: string, args: list<string>) -> result<child, spawn-error>;
+}
+
+/// Host reporting hook available to policy modules.
+interface reporting {
+    /// Publish a normalized reward in the inclusive range [0.0, 1.0].
+    /// Returns an error when the value is out of range or not finite.
+    report-reward: async func(reward: f64) -> result<_, string>;
+}
+
+/// The world that policy WASM components target.
+world policy {
+    /// WASI 0.3 basics for component execution.
+    include wasi:cli/imports@0.3.0-rc-2026-01-06;
+
+    import wasi:http/types@0.3.0-rc-2026-01-06;
+    import wasi:http/client@0.3.0-rc-2026-01-06;
+    import terminal;
+    import process;
+    import reporting;
+    export policy-api;
+}
+
+/// Same as `policy`, with additional Tree-sitter capability expected to be
+/// fulfilled by component composition.
+world treesitter-policy {
+    include wasi:cli/imports@0.3.0-rc-2026-01-06;
+
+    import wasi:http/types@0.3.0-rc-2026-01-06;
+    import wasi:http/client@0.3.0-rc-2026-01-06;
+    import terminal;
+    import process;
+    import reporting;
+    import mitb:treesitter/api@0.1.0;
+    export policy-api;
+}

@@ -1,0 +1,16 @@
+[package]
+name = "treesitter-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+regex = "1.12.2"
+wit-bindgen.workspace = true
+
+[build-dependencies]
+mitb-sdk = { workspace = true, features = ["build-support"] }
+
+[lib]
+crate-type = ["cdylib"]
