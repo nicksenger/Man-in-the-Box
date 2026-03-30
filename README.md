@@ -6,7 +6,9 @@ Watch the _Man in the Box_ have Codex 5.3 improve the Maintainability Index of C
 
 https://github.com/user-attachments/assets/2a42199b-8d85-4dd6-87ab-be29e51a8b55
 
-Please note that the _Man in the Box_ is fundamentally a PTY automation utility, **not** a **sandbox** or a **throttle**. You will need to handle safety and provisioning on your own.
+Please note that the _Man in the Box_ is fundamentally a PTY automation utility. It does **not sandbox** your agent or have any conception of token-limits unless it is programmed into your policy.
+
+While it does theoretically provide some protection around running/sharing untrusted reward policy modules, this isn't really the focus of the project. Use `--disable-spawn`, `--disable-networking`, `--disable-filesystem` to limit control of reward policy modules.
 
 ## Installation
 
@@ -239,16 +241,15 @@ Note that a full control interface is intentionally **not** exposed.
 
 If `~/.mitb/mitb.mkv` exists, `mitb` will decode and overlay AV1 video directly into the PTY viewer [iced](https://github.com/iced-rs/iced) render loop while playing Opus audio in the background. AV1 and Opus are the only supported codecs. If the `~/.mitb/mitb.mkv` file does not exist, no overlay will be rendered.
 
-I recommend using the 1991 single "Man in the Box" by Alice in Chains, since that's what this project was named after. Here is a command to download it from the Internet Archive, convert it, and place it in the expected location:
+Here is a sample command you can use to download a video, convert it to the correct format, and put it in the right place for `mitb`:
 
 ```bash
 mkdir -p "$HOME/.mitb" && \
-  ffmpeg -y -i input.mp4 \
+  wget -O /tmp/mitb-source.mp4 \
+    "https://archive.org/serve/ALICE_IN_CHAINS_Man_in_the_Box_1991/ALICE_IN_CHAINS_Man_in_the_Box_1991.mp4" && \
+  ffmpeg -y -i /tmp/mitb-source.mp4 \
     -c:v libsvtav1 \
     -c:a libopus \
-    "$HOME/.mitb/mitb.mkv"
+    /tmp/mitb.mkv && \
+  mv /tmp/mitb.mkv "$HOME/.mitb/mitb.mkv"
 ```
-
-If you like the song, download it on Spotify, or better yet buy an album.
-
-R.I.P, Layne.
