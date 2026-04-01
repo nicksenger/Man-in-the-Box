@@ -1,14 +1,14 @@
-# Man in the Box
+# Man-in-the-Box
 
-Man in the Box (`mitb`) runs a WebAssembly (WASI) reward-policy against a PTY-hosted agentic terminal interface with BYOV (bring your own video) overlay. Direct user interaction with the terminal is blocked to prevent the user from interfering with the _Man in the Box_.
+Man-in-the-Box (`mitb`) runs a WebAssembly (WASI) reward-policy against a PTY-hosted agentic terminal interface with BYOV (bring your own video) overlay. Direct user interaction with the terminal is blocked to prevent the user from interfering with the _Man in the Box_.
 
-Watch the _Man in the Box_ have Codex 5.3 improve the Maintainability Index of Codex CLI after a grueling game of guess-the-number (fast-forwarded):
+Watch the Man-in-the-Box have Codex 5.3 improve the Maintainability Index of Codex CLI with a _Man in the Box_ overlay:
 
-https://github.com/user-attachments/assets/2a42199b-8d85-4dd6-87ab-be29e51a8b55
+https://github.com/user-attachments/assets/ee8aee83-215c-4b0d-bed9-295db945d1f8
 
-Please note that the _Man in the Box_ is fundamentally a PTY automation utility. It does **not sandbox** your agent or have any conception of token-limits unless it is programmed into your policy.
+Please note that Man-in-the-Box is fundamentally a PTY automation utility designed to automate the act of **prompting**. It does **not sandbox** your agent or have any conception of token-limits unless it is programmed into your policy.
 
-While it does theoretically provide some protection around running/sharing untrusted reward policy modules, this isn't really the focus of the project. Use `--disable-spawn`, `--disable-networking`, `--disable-filesystem` to limit control of reward policy modules.
+While it does theoretically provide some protection around running/sharing untrusted reward policy modules, and could technically used to parse model output into sandboxed side-effect executions, these things aren't the focus of the project. Use `--disable-spawn`, `--disable-networking`, `--disable-filesystem` to limit control of reward policy modules if necessary.
 
 ## Installation
 

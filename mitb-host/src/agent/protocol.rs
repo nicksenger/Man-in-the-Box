@@ -90,5 +90,5 @@ pub(super) enum AgentDataMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum AgentReportMessage {
-    Reward { reward: f64 },
+    Reward { reward: f64, reported_at_ms: u64 },
 }

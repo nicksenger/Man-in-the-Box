@@ -307,8 +307,16 @@
                   payload.type === "reward" &&
                   Number.isFinite(payload.reward)
                 ) {
+                  const reportedAtMs = Number.isFinite(payload.reported_at_ms)
+                    ? payload.reported_at_ms
+                    : Number.isFinite(payload.reported_at)
+                      ? payload.reported_at
+                      : NaN;
+                  const timestamp = Number.isFinite(reportedAtMs)
+                    ? formatTimestamp(new Date(reportedAtMs))
+                    : formatTimestamp();
                   logLine(
-                    `[${formatTimestamp()}][${agentId}] reward ${payload.reward.toFixed(6)}`
+                    `[${timestamp}][${agentId}] reward ${payload.reward.toFixed(6)}`
                   );
                   return;
                 }

@@ -4,6 +4,7 @@ use ice::mdns::MulticastDnsMode;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -50,8 +51,14 @@ pub struct AgentOptions {
 
 #[derive(Debug, Clone)]
 pub struct ReportStore {
-    history: Arc<Mutex<Vec<f64>>>,
-    tx: broadcast::Sender<f64>,
+    history: Arc<Mutex<Vec<RewardReport>>>,
+    tx: broadcast::Sender<RewardReport>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RewardReport {
+    reward: f64,
+    reported_at_ms: u64,
 }
 
 impl Default for ReportStore {
@@ -71,18 +78,22 @@ impl ReportStore {
 
     pub async fn publish(&self, reward: f64) -> Result<(), String> {
         validate_reward(reward)?;
+        let report = RewardReport {
+            reward,
+            reported_at_ms: current_timestamp_ms(),
+        };
         let mut history = self.history.lock().await;
-        history.push(reward);
+        history.push(report);
         drop(history);
-        let _ = self.tx.send(reward);
+        let _ = self.tx.send(report);
         Ok(())
     }
 
-    pub async fn snapshot(&self) -> Vec<f64> {
+    async fn snapshot(&self) -> Vec<RewardReport> {
         self.history.lock().await.clone()
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<f64> {
+    fn subscribe(&self) -> broadcast::Receiver<RewardReport> {
         self.tx.subscribe()
     }
 }
@@ -376,21 +387,27 @@ fn install_data_channel_callbacks(
     }));
 }
 
-async fn broadcast_report(peers: &HashMap<String, AgentPeer>, reward: f64) {
+async fn broadcast_report(peers: &HashMap<String, AgentPeer>, report: RewardReport) {
     for (zookeeper_id, peer) in peers {
         if peer.data_channel.ready_state() != RTCDataChannelState::Open {
             continue;
         }
 
-        if let Err(error) = send_report(&peer.data_channel, reward).await {
+        if let Err(error) = send_report(&peer.data_channel, report).await {
             warn!(zookeeper_id = %zookeeper_id, %error, "failed sending report to zookeeper");
         }
     }
 }
 
-async fn send_report(data_channel: &Arc<RTCDataChannel>, reward: f64) -> Result<(), String> {
-    let payload = serde_json::to_vec(&AgentReportMessage::Reward { reward })
-        .map_err(|error| format!("failed serializing reward report: {error}"))?;
+async fn send_report(
+    data_channel: &Arc<RTCDataChannel>,
+    report: RewardReport,
+) -> Result<(), String> {
+    let payload = serde_json::to_vec(&AgentReportMessage::Reward {
+        reward: report.reward,
+        reported_at_ms: report.reported_at_ms,
+    })
+    .map_err(|error| format!("failed serializing reward report: {error}"))?;
     data_channel
         .send(&Bytes::from(payload))
         .await
@@ -406,6 +423,13 @@ fn validate_reward(reward: f64) -> Result<(), String> {
         return Err(format!("reward must be in [0.0, 1.0], got {reward}"));
     }
     Ok(())
+}
+
+fn current_timestamp_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(u128::from(u64::MAX)) as u64,
+        Err(_) => 0,
+    }
 }
 
 #[cfg(test)]

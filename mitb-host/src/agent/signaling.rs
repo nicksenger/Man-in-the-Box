@@ -85,7 +85,7 @@ async fn process_next_loop_event(
              impl futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
              + Unpin
          ),
-    report_rx: &mut broadcast::Receiver<f64>,
+    report_rx: &mut broadcast::Receiver<RewardReport>,
     shutdown_tick: &mut tokio::time::Interval,
     context: &mut ServerMessageContext<'_>,
 ) -> Result<SessionDirective, AgentError> {
@@ -120,7 +120,7 @@ async fn handle_websocket_event(
 }
 
 async fn handle_report_event(
-    report: Result<f64, broadcast::error::RecvError>,
+    report: Result<RewardReport, broadcast::error::RecvError>,
     peers: &HashMap<String, AgentPeer>,
 ) -> SessionDirective {
     match report {
