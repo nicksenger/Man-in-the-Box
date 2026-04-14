@@ -95,21 +95,48 @@ impl Maintainability {
             return None;
         }
 
-        let without_dot = trimmed.strip_prefix("./").unwrap_or(trimmed);
-        if without_dot == "." {
-            return Some(String::from("."));
-        }
-
-        let normalized = without_dot.replace('\\', "/").trim_matches('/').to_string();
-        if normalized.is_empty() {
+        if trimmed == "." {
             Some(String::from("."))
         } else {
-            Some(normalized)
+            let slash_normalized = trimmed.replace('\\', "/");
+            if slash_normalized.starts_with('/') {
+                return None;
+            }
+
+            let mut components = Vec::<&str>::new();
+            for component in slash_normalized.split('/') {
+                if component.is_empty() || component == "." {
+                    continue;
+                }
+
+                if component == ".." {
+                    if components
+                        .last()
+                        .copied()
+                        .is_some_and(|segment| segment != "..")
+                    {
+                        let _ = components.pop();
+                    } else {
+                        components.push(component);
+                    }
+                    continue;
+                }
+
+                components.push(component);
+            }
+
+            if components.is_empty() {
+                Some(String::from("."))
+            } else {
+                Some(components.join("/"))
+            }
         }
     }
 
     fn path_is_ignored(path: &str, ignored_paths: &[String]) -> bool {
-        let normalized = path.strip_prefix("./").unwrap_or(path).replace('\\', "/");
+        let Some(normalized) = Self::normalize_path(path) else {
+            return false;
+        };
         ignored_paths.iter().any(|ignored| {
             ignored == "."
                 || normalized == *ignored
@@ -501,6 +528,37 @@ fn generate_session_id() -> String {
         session_id.push(char::from(ALPHANUMERIC[index]));
     }
     session_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Maintainability;
+
+    #[test]
+    fn normalize_path_collapses_relative_segments() {
+        assert_eq!(
+            Maintainability::normalize_path("./src/./core/../lib.rs"),
+            Some(String::from("src/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn ignored_path_matches_nested_file_recursively() {
+        let ignored = vec![String::from("src/generated")];
+        assert!(Maintainability::path_is_ignored(
+            "src/generated/sub/module.rs",
+            ignored.as_slice()
+        ));
+    }
+
+    #[test]
+    fn ignored_path_does_not_match_prefix_only_name() {
+        let ignored = vec![String::from("src/gen")];
+        assert!(!Maintainability::path_is_ignored(
+            "src/generated/module.rs",
+            ignored.as_slice()
+        ));
+    }
 }
 
 bindings::export_policy!(Maintainability);
