@@ -3,6 +3,7 @@ mitb_sdk::policy_prelude!("maintainability");
 use std::collections::HashSet;
 
 const RUST_LANGUAGE: &str = "rust";
+const IGNORED_PATHS_ENV: &str = "MITB_MAINTAINABILITY_IGNORED_PATHS";
 const CYCLOMATIC_QUERY: &str = r#"
 [
   (if_expression)
@@ -66,6 +67,67 @@ struct PolicyState {
 }
 
 impl Maintainability {
+    fn ignored_paths_from_env() -> Vec<String> {
+        let environment = bindings::wasi::cli::environment::get_environment();
+        for (key, value) in environment {
+            if key == IGNORED_PATHS_ENV {
+                return Self::parse_ignored_paths(value.as_str());
+            }
+        }
+        Vec::new()
+    }
+
+    fn parse_ignored_paths(raw: &str) -> Vec<String> {
+        let mut parsed = Vec::<String>::new();
+        for part in raw.split([',', ';', '\n']) {
+            if let Some(path) = Self::normalize_path(part)
+                && !parsed.contains(&path)
+            {
+                parsed.push(path);
+            }
+        }
+        parsed
+    }
+
+    fn normalize_path(path: &str) -> Option<String> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let without_dot = trimmed.strip_prefix("./").unwrap_or(trimmed);
+        if without_dot == "." {
+            return Some(String::from("."));
+        }
+
+        let normalized = without_dot.replace('\\', "/").trim_matches('/').to_string();
+        if normalized.is_empty() {
+            Some(String::from("."))
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn path_is_ignored(path: &str, ignored_paths: &[String]) -> bool {
+        let normalized = path.strip_prefix("./").unwrap_or(path).replace('\\', "/");
+        ignored_paths.iter().any(|ignored| {
+            ignored == "."
+                || normalized == *ignored
+                || normalized
+                    .strip_prefix(ignored.as_str())
+                    .map(|suffix| suffix.starts_with('/'))
+                    .unwrap_or(false)
+        })
+    }
+
+    fn ignored_paths_prompt_clause(ignored_paths: &[String]) -> String {
+        if ignored_paths.is_empty() {
+            String::from("Ignored paths: none.")
+        } else {
+            format!("Ignored paths: {}.", ignored_paths.join(", "))
+        }
+    }
+
     fn query_error_string(error: bindings::mitb::treesitter::api::QueryError) -> &'static str {
         match error {
             bindings::mitb::treesitter::api::QueryError::UnsupportedLanguage => {
@@ -283,20 +345,32 @@ impl Policy for Maintainability {
         let (cyclomatic_query_id, halstead_query_id) = self.ensure_queries().await?;
         self.ensure_session_id_recorded();
         self.ensure_search_state_recorded().await?;
+        let ignored_paths = Self::ignored_paths_from_env();
+        let ignored_prompt_clause = Self::ignored_paths_prompt_clause(ignored_paths.as_slice());
 
-        let files = mitb_sdk::fs::find("*.rs", mitb_sdk::fs::FindOptions::default()).await?;
-        let project_loc = mitb_sdk::fs::count_lines("*.rs").await?;
+        let files = mitb_sdk::fs::find("*.rs", mitb_sdk::fs::FindOptions::default())
+            .await?
+            .into_iter()
+            .filter(|file| !Self::path_is_ignored(file.path.as_str(), ignored_paths.as_slice()))
+            .collect::<Vec<_>>();
         if files.is_empty() {
             let mi = 100.0;
             let reward = 1.0;
             let snapshot = self.commit_iteration_snapshot(mi).await?;
             report_reward!(reward);
-            log::info!("mi=100.00 reward=1.0000 loc=0 cc=0.00 halstead_volume=0.00 files=0");
-            self.navigate_reward_landscape(mi, reward, project_loc, &snapshot)
-                .await?;
-            return prompt!(
-                "The maintainability index of this application is currently 100.00. Refactor to improve the maintainability index."
+            log::info!(
+                "mi=100.00 reward=1.0000 loc=0 cc=0.00 halstead_volume=0.00 files=0 ignored_paths={}",
+                if ignored_paths.is_empty() {
+                    String::from("none")
+                } else {
+                    ignored_paths.join(",")
+                }
             );
+            self.navigate_reward_landscape(mi, reward, 0, &snapshot)
+                .await?;
+            return prompt!(format!(
+                "The maintainability index of this application is currently 100.00. Refactor to improve the maintainability index. {ignored_prompt_clause}"
+            ));
         }
 
         let mut analyzed_files = 0_u64;
@@ -304,10 +378,13 @@ impl Policy for Maintainability {
         let mut cyclomatic_sum = 0.0_f64;
         let mut halstead_volume_sum = 0.0_f64;
         let mut loc_sum = 0.0_f64;
+        let mut project_loc = 0_u64;
 
         for file in files {
             let source = mitb_sdk::fs::read_text(file.path.as_str()).await?;
-            let file_loc = Self::count_lines(source.as_str()) as f64;
+            let file_loc_raw = Self::count_lines(source.as_str());
+            let file_loc = file_loc_raw as f64;
+            project_loc = project_loc.saturating_add(file_loc_raw);
             let tree_id = bindings::mitb::treesitter::api::parse(RUST_LANGUAGE, source.as_str())
                 .map_err(|error| {
                     format!(
@@ -397,9 +474,9 @@ impl Policy for Maintainability {
         );
         self.navigate_reward_landscape(mi, reward, project_loc, &snapshot)
             .await?;
-        prompt!(
-            "The maintainability index of this application is currently {mi:.2}. Refactor to improve the maintainability index."
-        )
+        prompt!(format!(
+            "The maintainability index of .rs files under the current directory is {mi:.2}. Refactor to improve the maintainability index. {ignored_prompt_clause}"
+        ))
     }
 }
 
