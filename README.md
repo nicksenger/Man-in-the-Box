@@ -8,7 +8,7 @@ https://github.com/user-attachments/assets/ee8aee83-215c-4b0d-bed9-295db945d1f8
 
 Please note that Man-in-the-Box is fundamentally a PTY automation utility designed to automate the act of **prompting**. It does **not sandbox** your agent or have any conception of token-limits unless it is programmed into your policy.
 
-While it does theoretically provide some protection around running/sharing untrusted reward policy modules, and could technically used to parse model output into sandboxed side-effect executions, these things aren't the focus of the project. Use `--disable-spawn`, `--disable-networking`, `--disable-filesystem` to limit control of reward policy modules if necessary.
+While it does theoretically provide some protection around running/sharing untrusted reward policy modules, and could technically used to parse model output into sandboxed side-effect executions, these things aren't the focus of the project. Use `--disable-spawn`, `--disable-networking`, `--disable-filesystem` to limit control of reward policy modules if necessary, and `--mute` to disable overlay audio output.
 
 ## Installation
 
@@ -239,7 +239,7 @@ Note that a full control interface is intentionally **not** exposed.
 
 ### BYOV Overlay
 
-If `~/.mitb/mitb.mkv` exists, `mitb` will decode and overlay AV1 video directly into the PTY viewer [iced](https://github.com/iced-rs/iced) render loop while playing Opus audio in the background. AV1 and Opus are the only supported codecs. If the `~/.mitb/mitb.mkv` file does not exist, no overlay will be rendered.
+If `~/.mitb/mitb.mkv` exists, `mitb` will decode and overlay AV1 video directly into the PTY viewer [iced](https://github.com/iced-rs/iced) render loop while playing Opus audio in the background. Use `--mute` to keep the overlay video while suppressing audio output. AV1 and Opus are the only supported codecs. If the `~/.mitb/mitb.mkv` file does not exist, no overlay will be rendered.
 
 Here is a sample command you can use to download a video, convert it to the correct format, and put it in the right place for `mitb`:
 

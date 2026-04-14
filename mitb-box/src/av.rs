@@ -22,7 +22,7 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(mute_audio: bool) -> Self {
         if AV_EVENT_RX.get().is_none() {
             let media_path = match mitb_av::default_media_path() {
                 Ok(path) => path,
@@ -33,7 +33,10 @@ impl State {
             };
 
             if media_path.exists() {
-                let receiver = mitb_av::spawn(media_path);
+                let receiver = mitb_av::spawn_with_options(
+                    media_path,
+                    mitb_av::PlaybackOptions { mute_audio },
+                );
                 let _ = AV_EVENT_RX.set(Arc::new(tokio::sync::Mutex::new(receiver)));
             } else {
                 debug!("AV media file not found; overlay playback disabled");

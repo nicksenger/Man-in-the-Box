@@ -10,6 +10,7 @@ use iced::widget::{Column, Float, Stack, column, container, mouse_area, row, scr
 use iced::{Element, Fill, Font, Point, Size, Subscription, Task, Vector, event, keyboard, mouse};
 use mitb_host::HostEvent;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -17,6 +18,7 @@ use tracing::warn;
 static HOST_EVENT_RX: std::sync::OnceLock<
     std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<HostEvent>>>,
 > = std::sync::OnceLock::new();
+static MUTE_AUDIO: AtomicBool = AtomicBool::new(false);
 const WINDOW_WIDTH: f32 = 640.0;
 const WINDOW_HEIGHT: f32 = 480.0;
 const TERMINAL_COLS: usize = 72;
@@ -33,6 +35,11 @@ pub enum BoxError {
     ReceiverAlreadyInitialized,
     #[error("mitb-box UI error: {0}")]
     Iced(#[from] iced::Error),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    pub mute_audio: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,10 +61,14 @@ enum InputEvent {
     KeyReleased(keyboard::key::Physical),
 }
 
-pub fn run(event_rx: mpsc::UnboundedReceiver<HostEvent>) -> Result<(), BoxError> {
+pub fn run(
+    event_rx: mpsc::UnboundedReceiver<HostEvent>,
+    options: RunOptions,
+) -> Result<(), BoxError> {
     HOST_EVENT_RX
         .set(std::sync::Arc::new(tokio::sync::Mutex::new(event_rx)))
         .map_err(|_| BoxError::ReceiverAlreadyInitialized)?;
+    MUTE_AUDIO.store(options.mute_audio, Ordering::Relaxed);
 
     iced::application(App::new, App::update, App::view)
         .subscription(App::subscription)
@@ -83,7 +94,7 @@ impl App {
         (
             Self {
                 terminal: terminal::Terminal::new(TERMINAL_COLS, TERMINAL_ROWS),
-                av: av::State::new(),
+                av: av::State::new(MUTE_AUDIO.load(Ordering::Relaxed)),
                 status: None,
                 app_cursor_position: None,
                 terminal_hovered: false,

@@ -27,6 +27,11 @@ const DEFAULT_MEDIA_FILE_NAME: &str = "mitb.mkv";
 const DEFAULT_FRAME_DURATION_NS: u64 = 33_333_333;
 const DEFAULT_AUDIO_SAMPLE_RATE: u32 = 48_000;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaybackOptions {
+    pub mute_audio: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum AvEvent {
     VideoFrame(Yuv),
@@ -239,15 +244,22 @@ impl AudioOutput {
 
 pub fn spawn_default() -> Result<mpsc::UnboundedReceiver<AvEvent>, AvError> {
     let media_path = default_media_path()?;
-    Ok(spawn(media_path))
+    Ok(spawn_with_options(media_path, PlaybackOptions::default()))
 }
 
 pub fn spawn(media_path: PathBuf) -> mpsc::UnboundedReceiver<AvEvent> {
+    spawn_with_options(media_path, PlaybackOptions::default())
+}
+
+pub fn spawn_with_options(
+    media_path: PathBuf,
+    options: PlaybackOptions,
+) -> mpsc::UnboundedReceiver<AvEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
         .name(String::from("mitb-av-playback"))
-        .spawn(move || run_worker(media_path, tx))
+        .spawn(move || run_worker(media_path, options, tx))
         .map_err(|error| {
             warn!(%error, "failed to spawn AV worker thread");
         })
@@ -256,7 +268,7 @@ pub fn spawn(media_path: PathBuf) -> mpsc::UnboundedReceiver<AvEvent> {
     rx
 }
 
-fn run_worker(media_path: PathBuf, tx: mpsc::UnboundedSender<AvEvent>) {
+fn run_worker(media_path: PathBuf, options: PlaybackOptions, tx: mpsc::UnboundedSender<AvEvent>) {
     debug!(path = %media_path.display(), "started AV worker");
     if !media_path.exists() {
         debug!(path = %media_path.display(), "AV media file not found; worker exiting");
@@ -273,7 +285,7 @@ fn run_worker(media_path: PathBuf, tx: mpsc::UnboundedSender<AvEvent>) {
             "starting AV playback loop"
         );
 
-        match play_media_file(media_path.as_path(), &tx) {
+        match play_media_file(media_path.as_path(), options, &tx) {
             Ok(()) => {
                 if tx.is_closed() {
                     break;
@@ -300,7 +312,11 @@ fn run_worker(media_path: PathBuf, tx: mpsc::UnboundedSender<AvEvent>) {
     let _ = tx.send(AvEvent::PlaybackEnded);
 }
 
-fn play_media_file(path: &Path, tx: &mpsc::UnboundedSender<AvEvent>) -> Result<(), AvError> {
+fn play_media_file(
+    path: &Path,
+    options: PlaybackOptions,
+    tx: &mpsc::UnboundedSender<AvEvent>,
+) -> Result<(), AvError> {
     let file = File::open(path).map_err(|source| AvError::OpenMedia {
         path: path.to_path_buf(),
         source,
@@ -320,9 +336,13 @@ fn play_media_file(path: &Path, tx: &mpsc::UnboundedSender<AvEvent>) -> Result<(
     let mut video_decoder =
         Av1Decoder::new().map_err(|error| AvError::VideoDecoder(error.to_string()))?;
 
-    let mut audio_decoder = match tracks.audio.as_ref() {
-        Some(audio_track) => Some(SymphoniaOpusDecoder::new(audio_track)?),
-        None => None,
+    let mut audio_decoder = if options.mute_audio {
+        None
+    } else {
+        match tracks.audio.as_ref() {
+            Some(audio_track) => Some(SymphoniaOpusDecoder::new(audio_track)?),
+            None => None,
+        }
     };
 
     if let Some(decoder) = audio_decoder.as_ref() {
@@ -334,17 +354,22 @@ fn play_media_file(path: &Path, tx: &mpsc::UnboundedSender<AvEvent>) -> Result<(
         );
     }
 
-    let mut audio_output = match tracks.audio.as_ref() {
-        Some(audio_track) => {
-            match AudioOutput::new(audio_track.channels, audio_track.sample_rate) {
-                Ok(output) => Some(output),
-                Err(error) => {
-                    warn!(%error, "audio output unavailable; continuing video-only playback");
-                    None
+    let mut audio_output = if options.mute_audio {
+        debug!("audio playback muted by option");
+        None
+    } else {
+        match tracks.audio.as_ref() {
+            Some(audio_track) => {
+                match AudioOutput::new(audio_track.channels, audio_track.sample_rate) {
+                    Ok(output) => Some(output),
+                    Err(error) => {
+                        warn!(%error, "audio output unavailable; continuing video-only playback");
+                        None
+                    }
                 }
             }
+            None => None,
         }
-        None => None,
     };
 
     let mut remaining_pre_skip = tracks.audio.as_ref().map_or(0, |audio| audio.pre_skip);

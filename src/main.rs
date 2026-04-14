@@ -12,6 +12,7 @@ struct CliOptions {
     policy_component: PathBuf,
     command: String,
     command_args: Vec<String>,
+    mute: bool,
     disable_spawn: bool,
     disable_networking: bool,
     disable_filesystem: bool,
@@ -78,6 +79,12 @@ fn cli() -> Command {
                 .help("Optional agent identifier shown in remote reports"),
         )
         .arg(
+            Arg::new("mute")
+                .long("mute")
+                .action(ArgAction::SetTrue)
+                .help("Disable overlay audio output"),
+        )
+        .arg(
             Arg::new("disable_spawn")
                 .long("disable-spawn")
                 .action(ArgAction::SetTrue)
@@ -137,6 +144,7 @@ fn parse_options() -> Result<CliOptions, CliError> {
     let alias = matches
         .get_one::<String>("alias")
         .map(|value| value.trim().to_owned());
+    let mute = matches.get_flag("mute");
     let disable_spawn = matches.get_flag("disable_spawn");
     let disable_networking = matches.get_flag("disable_networking");
     let disable_filesystem = matches.get_flag("disable_filesystem");
@@ -211,6 +219,7 @@ fn parse_options() -> Result<CliOptions, CliError> {
         policy_component,
         command,
         command_args,
+        mute,
         disable_spawn,
         disable_networking,
         disable_filesystem,
@@ -228,6 +237,7 @@ fn main() -> Result<(), CliError> {
     info!(
         policy = %options.policy_component.display(),
         command = %options.command,
+        mute = options.mute,
         disable_spawn = options.disable_spawn,
         disable_networking = options.disable_networking,
         disable_filesystem = options.disable_filesystem,
@@ -265,7 +275,12 @@ fn main() -> Result<(), CliError> {
     debug!("starting host thread and box UI");
     let host_thread = std::thread::spawn(move || run_host_blocking(host_options));
 
-    let box_result = mitb_box::run(event_rx);
+    let box_result = mitb_box::run(
+        event_rx,
+        mitb_box::RunOptions {
+            mute_audio: options.mute,
+        },
+    );
     shutdown.store(true, Ordering::Relaxed);
 
     let host_result = match host_thread.join() {
