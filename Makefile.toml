@@ -47,6 +47,18 @@ args = [
   "wasi_snapshot_preview1=mitb-examples/wasi_snapshot_preview1.reactor.wasm",
 ]
 
+[tasks.adapt-git-responder]
+command = "wasm-tools"
+args = [
+  "component",
+  "new",
+  "mitb-examples/target/wasm32-unknown-unknown/release/git_responder.wasm",
+  "-o",
+  "mitb-examples/target/git-responder.component.wasm",
+  "--adapt",
+  "wasi_snapshot_preview1=mitb-examples/wasi_snapshot_preview1.reactor.wasm",
+]
+
 [tasks.component-treesitter-provider]
 command = "wasm-tools"
 args = [
@@ -71,6 +83,7 @@ args = [
 [tasks.adapt]
 dependencies = [
   "adapt-always-wait",
+  "adapt-git-responder",
   "adapt-maintainability",
   "adapt-number-game",
   "component-treesitter-provider",

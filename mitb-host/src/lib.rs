@@ -10,7 +10,9 @@ mod transcript;
 pub use agent::{AgentOptions, ReportStore};
 pub use error::HostError;
 use policy_log::PolicyLogWriter;
-use pty_io::{PtyWriter, read_pty_output, write_inputs as write_pty_inputs};
+use pty_io::{
+    PtyWriter, forward_keyboard_input, read_pty_output, write_inputs as write_pty_inputs,
+};
 use stream_bridge::{MpscStreamConsumer, MpscStreamProducer};
 use transcript::{transcript_bytes_since, transcript_head, transcript_snapshot_bytes};
 
@@ -30,7 +32,7 @@ mod bindings {
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -48,7 +50,9 @@ use wasmtime_wasi_http::p3::{
 };
 
 const MITB_HOME_DIR_ENV: &str = "MITB_HOME_DIR";
+const MITB_SHARED_ROOT_ENV: &str = "MITB_SHARED_ROOT";
 const MITB_ALIAS_ENV: &str = "MITB_ALIAS";
+const MITB_SHARED_ROOT_GUEST_PATH: &str = "mitb-shared";
 const PTY_COLS: u16 = 72;
 const PTY_ROWS: u16 = 27;
 const PTY_PIXEL_WIDTH: u16 = 640;
@@ -56,12 +60,13 @@ const PTY_PIXEL_HEIGHT: u16 = 480;
 
 #[derive(Debug, Clone)]
 pub enum HostEvent {
+    KeyboardInput(Vec<u8>),
     TerminalOutput(Vec<u8>),
     SessionEnded(String),
     Disconnected,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HostOptions {
     pub policy_component: PathBuf,
     pub command: String,
@@ -73,6 +78,7 @@ pub struct HostOptions {
     pub poll_interval: Duration,
     pub max_transcript_bytes: usize,
     pub event_sender: Option<mpsc::UnboundedSender<HostEvent>>,
+    pub keyboard_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
     pub shutdown: Option<Arc<AtomicBool>>,
     pub agent: Option<AgentOptions>,
 }
@@ -90,6 +96,7 @@ impl HostOptions {
             poll_interval: Duration::from_secs(5),
             max_transcript_bytes: 512 * 1024,
             event_sender: None,
+            keyboard_rx: None,
             shutdown: None,
             agent: None,
         }
@@ -173,13 +180,22 @@ struct PtySession {
     writer: PtyWriter,
     child: Arc<Mutex<Box<dyn Child + Send>>>,
     reader_task: JoinHandle<Result<(), HostError>>,
+    keyboard_task: JoinHandle<Result<(), HostError>>,
+    keyboard_stop: Arc<AtomicBool>,
 }
 
 impl PtySession {
-    fn spawn(options: &HostOptions, transcript: SharedTranscript) -> Result<Self, HostError> {
+    fn spawn(
+        command: String,
+        command_args: Vec<String>,
+        transcript: SharedTranscript,
+        max_bytes: usize,
+        event_sender: Option<mpsc::UnboundedSender<HostEvent>>,
+        keyboard_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> Result<Self, HostError> {
         info!(
-            command = %options.command,
-            args = ?options.command_args,
+            command = %command,
+            args = ?command_args,
             "spawning PTY child process"
         );
         let pty_system = native_pty_system();
@@ -190,23 +206,24 @@ impl PtySession {
             pixel_height: PTY_PIXEL_HEIGHT,
         })?;
 
-        let mut command = CommandBuilder::new(&options.command);
-        for arg in &options.command_args {
-            command.arg(arg);
+        let mut cmd = CommandBuilder::new(&command);
+        for arg in &command_args {
+            cmd.arg(arg);
         }
         let cwd = std::env::current_dir()?;
         info!(cwd = %cwd.display(), "setting PTY working directory");
-        command.cwd(cwd.as_os_str());
+        cmd.cwd(cwd.as_os_str());
 
-        let child = pair.slave.spawn_command(command)?;
+        let child = pair.slave.spawn_command(cmd)?;
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let writer = Arc::new(Mutex::new(writer));
+        let keyboard_stop = Arc::new(AtomicBool::new(false));
 
         let transcript_reader = Arc::clone(&transcript);
-        let max_bytes = options.max_transcript_bytes;
-        let event_sender = options.event_sender.clone();
         let response_writer = Arc::clone(&writer);
+        let keyboard_writer = Arc::clone(&writer);
+        let keyboard_stop_for_task = Arc::clone(&keyboard_stop);
 
         let reader_task = tokio::task::spawn_blocking(move || {
             read_pty_output(
@@ -217,11 +234,16 @@ impl PtySession {
                 event_sender,
             )
         });
+        let keyboard_task = tokio::task::spawn_blocking(move || {
+            forward_keyboard_input(keyboard_writer, keyboard_rx, keyboard_stop_for_task)
+        });
 
         Ok(Self {
             writer,
             child: Arc::new(Mutex::new(child)),
             reader_task,
+            keyboard_task,
+            keyboard_stop,
         })
     }
 
@@ -243,6 +265,7 @@ impl PtySession {
 
     async fn terminate(self) -> Result<(), HostError> {
         info!("terminating PTY session");
+        self.keyboard_stop.store(true, Ordering::Relaxed);
         let child = Arc::clone(&self.child);
         tokio::task::spawn_blocking(move || {
             let mut child = child.lock().map_err(|_| HostError::PoisonedLock("child"))?;
@@ -255,6 +278,7 @@ impl PtySession {
         .await??;
 
         self.reader_task.await??;
+        self.keyboard_task.await??;
         Ok(())
     }
 }
@@ -713,6 +737,10 @@ fn to_wasmtime_error(error: impl core::fmt::Display) -> wasmtime::Error {
 
 fn host_home_dir() -> Option<PathBuf> {
     std::env::home_dir()
+}
+
+fn host_shared_root_dir() -> Option<PathBuf> {
+    host_home_dir().map(|home| home.join(".mitb").join("shared"))
 }
 
 #[cfg(test)]

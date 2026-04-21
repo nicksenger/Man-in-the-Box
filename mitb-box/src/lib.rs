@@ -7,13 +7,18 @@ use animated_eye::animated_eye_cursor;
 use futures_lite::stream;
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::{Column, Float, Stack, column, container, mouse_area, row, scrollable, text};
-use iced::{Element, Fill, Font, Point, Size, Subscription, Task, Vector, event, keyboard, mouse};
+use iced::{
+    Element, Fill, Font, Point, Size, Subscription, Task, Vector, event, keyboard,
+    keyboard::key::Named, mouse,
+};
 use mitb_host::HostEvent;
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tracing::warn;
 
 static HOST_EVENT_RX: std::sync::OnceLock<
     std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<HostEvent>>>,
@@ -37,9 +42,10 @@ pub enum BoxError {
     Iced(#[from] iced::Error),
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     pub mute_audio: bool,
+    pub keyboard_tx: Option<Sender<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,11 +59,11 @@ enum Message {
     TerminalHoverChanged(bool),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum InputEvent {
     LeftMousePressed,
     LeftMouseReleased,
-    KeyPressed(keyboard::key::Physical),
+    KeyPressed(keyboard::key::Physical, keyboard::key::Key),
     KeyReleased(keyboard::key::Physical),
 }
 
@@ -65,18 +71,22 @@ pub fn run(
     event_rx: mpsc::UnboundedReceiver<HostEvent>,
     options: RunOptions,
 ) -> Result<(), BoxError> {
+    let keyboard_tx = Arc::new(Mutex::new(options.keyboard_tx));
     HOST_EVENT_RX
         .set(std::sync::Arc::new(tokio::sync::Mutex::new(event_rx)))
         .map_err(|_| BoxError::ReceiverAlreadyInitialized)?;
     MUTE_AUDIO.store(options.mute_audio, Ordering::Relaxed);
-
-    iced::application(App::new, App::update, App::view)
-        .subscription(App::subscription)
-        .default_font(Font::MONOSPACE)
-        .window_size(Size::new(WINDOW_WIDTH, WINDOW_HEIGHT))
-        .title("Man in the Box")
-        .run()
-        .map_err(BoxError::from)
+    iced::application(
+        move || App::new(Arc::clone(&keyboard_tx)),
+        App::update,
+        App::view,
+    )
+    .subscription(App::subscription)
+    .default_font(Font::MONOSPACE)
+    .window_size(Size::new(WINDOW_WIDTH, WINDOW_HEIGHT))
+    .title("Man in the Box")
+    .run()
+    .map_err(BoxError::from)
 }
 
 struct App {
@@ -87,10 +97,11 @@ struct App {
     terminal_hovered: bool,
     left_mouse_down: bool,
     pressed_keys: HashSet<keyboard::key::Physical>,
+    keyboard_tx: Arc<Mutex<Option<Sender<Vec<u8>>>>>,
 }
 
 impl App {
-    fn new() -> (Self, Task<Message>) {
+    fn new(keyboard_tx: Arc<Mutex<Option<Sender<Vec<u8>>>>>) -> (Self, Task<Message>) {
         (
             Self {
                 terminal: terminal::Terminal::new(TERMINAL_COLS, TERMINAL_ROWS),
@@ -100,6 +111,7 @@ impl App {
                 terminal_hovered: false,
                 left_mouse_down: false,
                 pressed_keys: HashSet::new(),
+                keyboard_tx,
             },
             Task::none(),
         )
@@ -108,6 +120,10 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::HostEvent(event) => match event {
+                HostEvent::KeyboardInput(_) => {
+                    // Keyboard input is handled separately via the direct channel, not HostEvent
+                    return Task::none();
+                }
                 HostEvent::TerminalOutput(data) => {
                     self.terminal.feed(&data);
                     Task::none()
@@ -129,14 +145,17 @@ impl App {
                 match input_event {
                     InputEvent::LeftMousePressed => {
                         self.left_mouse_down = true;
-                        warn!("denied");
                     }
                     InputEvent::LeftMouseReleased => {
                         self.left_mouse_down = false;
                     }
-                    InputEvent::KeyPressed(physical_key) => {
-                        if self.pressed_keys.insert(physical_key) {
-                            warn!("denied");
+                    InputEvent::KeyPressed(physical_key, key) => {
+                        self.pressed_keys.insert(physical_key);
+                        if let Some(bytes) = self.key_to_pty_bytes(&key) {
+                            let keyboard_tx = self.keyboard_tx.lock().unwrap().clone();
+                            if let Some(tx) = keyboard_tx {
+                                let _ = tx.send(bytes);
+                            }
                         }
                     }
                     InputEvent::KeyReleased(physical_key) => {
@@ -158,6 +177,17 @@ impl App {
                 self.terminal_hovered = is_hovered;
                 Task::none()
             }
+        }
+    }
+
+    fn key_to_pty_bytes(&self, key: &keyboard::key::Key) -> Option<Vec<u8>> {
+        match key {
+            keyboard::key::Key::Named(Named::Enter) => Some(vec![0x0d]),
+            keyboard::key::Key::Named(Named::ArrowUp) => Some(vec![0x1b, b'[', b'A']),
+            keyboard::key::Key::Named(Named::ArrowDown) => Some(vec![0x1b, b'[', b'B']),
+            keyboard::key::Key::Named(Named::ArrowLeft) => Some(vec![0x1b, b'[', b'D']),
+            keyboard::key::Key::Named(Named::ArrowRight) => Some(vec![0x1b, b'[', b'C']),
+            _ => None,
         }
     }
 
@@ -281,9 +311,10 @@ impl App {
                 }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
                     physical_key,
+                    key,
                     repeat,
                     ..
-                }) if !repeat => Some(Message::Input(InputEvent::KeyPressed(physical_key))),
+                }) if !repeat => Some(Message::Input(InputEvent::KeyPressed(physical_key, key))),
                 iced::Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) => {
                     Some(Message::Input(InputEvent::KeyReleased(physical_key)))
                 }

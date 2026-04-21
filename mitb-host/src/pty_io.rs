@@ -1,7 +1,9 @@
 use super::*;
 use crate::terminal_state::PtyTerminalState;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, trace};
@@ -9,8 +11,12 @@ use tracing::{debug, trace};
 const TEXT_CHUNK_BYTES: usize = 96;
 const TEXT_CHUNK_DELAY: Duration = Duration::from_millis(20);
 const KEY_DELAY_AFTER_TEXT: Duration = Duration::from_millis(250);
-const ENTER_DELAY_AFTER_TEXT: Duration = Duration::from_millis(700);
+const ENTER_DELAY_AFTER_TEXT_DEFAULT: Duration = Duration::from_millis(700);
 const KEY_DELAY_BETWEEN_KEYS: Duration = Duration::from_millis(120);
+const KEYBOARD_FORWARD_POLL: Duration = Duration::from_millis(50);
+const MITB_ENTER_DELAY_AFTER_TEXT_MS_ENV: &str = "MITB_ENTER_DELAY_AFTER_TEXT_MS";
+
+static ENTER_DELAY_AFTER_TEXT: OnceLock<Duration> = OnceLock::new();
 
 pub(crate) type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -34,7 +40,7 @@ pub(crate) async fn write_inputs(
                 let delay = match input {
                     bindings::mitb::host::types::Input::Key(
                         bindings::mitb::host::types::Key::Enter,
-                    ) => ENTER_DELAY_AFTER_TEXT,
+                    ) => enter_delay_after_text(),
                     _ => KEY_DELAY_AFTER_TEXT,
                 };
                 sleep(delay).await;
@@ -99,6 +105,27 @@ pub(crate) fn read_pty_output(
     }
 }
 
+pub(crate) fn forward_keyboard_input(
+    writer: PtyWriter,
+    keyboard_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), HostError> {
+    while !stop.load(Ordering::Relaxed) {
+        match keyboard_rx.recv_timeout(KEYBOARD_FORWARD_POLL) {
+            Ok(keyboard_data) => {
+                if keyboard_data.is_empty() {
+                    continue;
+                }
+                write_payload_blocking(&writer, &keyboard_data)?;
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+
+    Ok(())
+}
+
 async fn write_text_streamed(writer: &PtyWriter, text: &str) -> Result<(), HostError> {
     if text.is_empty() {
         return Ok(());
@@ -152,5 +179,63 @@ fn key_bytes(key: &bindings::mitb::host::types::Key) -> &'static [u8] {
         bindings::mitb::host::types::Key::ArrowRight => b"\x1b[C",
         bindings::mitb::host::types::Key::CtrlC => b"\x03",
         bindings::mitb::host::types::Key::CtrlD => b"\x04",
+    }
+}
+
+fn enter_delay_after_text() -> Duration {
+    *ENTER_DELAY_AFTER_TEXT.get_or_init(|| {
+        env_duration_from_millis(
+            MITB_ENTER_DELAY_AFTER_TEXT_MS_ENV,
+            ENTER_DELAY_AFTER_TEXT_DEFAULT,
+        )
+    })
+}
+
+fn env_duration_from_millis(env_key: &str, default_duration: Duration) -> Duration {
+    match std::env::var(env_key) {
+        Ok(raw_value) => parse_duration_from_millis(raw_value.as_str(), default_duration),
+        Err(_) => default_duration,
+    }
+}
+
+fn parse_duration_from_millis(raw_value: &str, default_duration: Duration) -> Duration {
+    let trimmed = raw_value.trim();
+    if trimmed.is_empty() {
+        return default_duration;
+    }
+
+    match trimmed.parse::<u64>() {
+        Ok(milliseconds) => Duration::from_millis(milliseconds),
+        Err(_) => default_duration,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ENTER_DELAY_AFTER_TEXT_DEFAULT, parse_duration_from_millis};
+    use std::time::Duration;
+
+    #[test]
+    fn parse_duration_from_millis_accepts_integer_values() {
+        assert_eq!(
+            parse_duration_from_millis("900", ENTER_DELAY_AFTER_TEXT_DEFAULT),
+            Duration::from_millis(900)
+        );
+    }
+
+    #[test]
+    fn parse_duration_from_millis_uses_default_for_invalid_values() {
+        assert_eq!(
+            parse_duration_from_millis("nope", ENTER_DELAY_AFTER_TEXT_DEFAULT),
+            ENTER_DELAY_AFTER_TEXT_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_duration_from_millis_uses_default_for_empty_values() {
+        assert_eq!(
+            parse_duration_from_millis("   ", ENTER_DELAY_AFTER_TEXT_DEFAULT),
+            ENTER_DELAY_AFTER_TEXT_DEFAULT
+        );
     }
 }

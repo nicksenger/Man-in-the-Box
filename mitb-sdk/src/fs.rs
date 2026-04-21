@@ -1,7 +1,7 @@
 use glob::{MatchOptions, Pattern};
 use regex::RegexBuilder;
 use wasip3::filesystem::types::{
-    Descriptor, DescriptorFlags, DescriptorType, ErrorCode, OpenFlags, PathFlags,
+    Descriptor, DescriptorFlags, DescriptorStat, DescriptorType, ErrorCode, OpenFlags, PathFlags,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +22,20 @@ pub enum DirEntryKind {
 pub struct DirEntry {
     pub name: String,
     pub kind: DirEntryKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateDirOutcome {
+    Created,
+    AlreadyExists,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathStat {
+    pub kind: DirEntryKind,
+    pub size: u64,
+    pub data_modification_seconds: Option<i64>,
+    pub status_change_seconds: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -220,24 +234,17 @@ pub async fn grep(query: &str, options: GrepOptions) -> Result<Vec<GrepMatch>, S
 
 /// Read a file from guest cwd and return raw bytes.
 pub async fn read(path: &str) -> Result<Vec<u8>, String> {
-    let normalized_path = normalize_relative_path(path)?;
-    let root = select_root_preopen()?;
-    let file = root
-        .open_at(
-            PathFlags::empty(),
-            normalized_path.to_string(),
-            OpenFlags::empty(),
-            DescriptorFlags::READ,
-        )
-        .await
-        .map_err(|error| {
-            format!(
+    let (file, display_name) = match open_file_for_read(path, MissingFileBehavior::Error).await? {
+        OpenFileForReadOutcome::Found { file, display_path } => (file, display_path),
+        OpenFileForReadOutcome::Missing { display_path: missing_path } => {
+            return Err(format!(
                 "failed opening file `{}`: {}",
-                display_path(normalized_path),
-                error.name()
-            )
-        })?;
-    read_file_descriptor(&file, normalized_path).await
+                display_path(missing_path.as_str()),
+                ErrorCode::NoEntry.name()
+            ));
+        }
+    };
+    read_file_descriptor(&file, display_name.as_str()).await
 }
 
 /// Read a UTF-8 text file from guest cwd.
@@ -247,11 +254,193 @@ pub async fn read_text(path: &str) -> Result<String, String> {
         .map_err(|error| format!("file `{}` is not valid utf-8: {error}", display_path(path)))
 }
 
+/// Read a UTF-8 text file from guest cwd when it exists.
+pub async fn read_text_if_exists(path: &str) -> Result<Option<String>, String> {
+    let OpenFileForReadOutcome::Found {
+        file,
+        display_path: display_name,
+    } =
+        open_file_for_read(path, MissingFileBehavior::ReturnNone).await?
+    else {
+        return Ok(None);
+    };
+    let bytes = read_file_descriptor(&file, display_name.as_str()).await?;
+    let text = String::from_utf8(bytes).map_err(|error| {
+        format!(
+            "file `{}` is not valid utf-8: {error}",
+            display_path(display_name.as_str())
+        )
+    })?;
+    Ok(Some(text))
+}
+
+/// Create a single directory.
+///
+/// This behaves like `mkdir`: it creates exactly one path segment and reports
+/// whether the directory already existed.
+pub async fn create_dir(path: &str) -> Result<CreateDirOutcome, String> {
+    let resolved = resolve_path(path, true)?;
+    if resolved.relative_path == "." {
+        return Ok(CreateDirOutcome::AlreadyExists);
+    }
+    match resolved
+        .root
+        .create_directory_at(resolved.relative_path.clone())
+        .await
+    {
+        Ok(()) => Ok(CreateDirOutcome::Created),
+        Err(ErrorCode::Exist) => Ok(CreateDirOutcome::AlreadyExists),
+        Err(error) => Err(format!(
+            "failed creating directory `{}`: {}",
+            display_path(resolved.display_path.as_str()),
+            error.name()
+        )),
+    }
+}
+
+/// Recursively create directories from guest cwd.
+pub async fn create_dir_all(path: &str) -> Result<(), String> {
+    let normalized = normalize_path_for_resolution(path, true)?;
+    if normalized == "." {
+        return Ok(());
+    }
+
+    let mut current = String::new();
+    for component in normalized.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            return Err(format!(
+                "parent path components are not supported: `{}`",
+                display_path(path)
+            ));
+        }
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(component);
+        let _ = create_dir(current.as_str()).await?;
+    }
+    Ok(())
+}
+
+/// Write bytes to a file from guest cwd (create + truncate).
+pub async fn write(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let resolved = resolve_path(path, false)?;
+    if resolved.relative_path == "." {
+        return Err(format!(
+            "path must reference a file: `{}`",
+            display_path(resolved.display_path.as_str())
+        ));
+    }
+    let file = resolved
+        .root
+        .open_at(
+            PathFlags::empty(),
+            resolved.relative_path.clone(),
+            OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            DescriptorFlags::WRITE,
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "failed opening file `{}` for write: {}",
+                display_path(resolved.display_path.as_str()),
+                error.name()
+            )
+        })?;
+    write_file_descriptor(&file, resolved.display_path.as_str(), bytes.to_vec()).await
+}
+
+/// Write UTF-8 text to a file from guest cwd (create + truncate).
+pub async fn write_text(path: &str, text: &str) -> Result<(), String> {
+    write(path, text.as_bytes()).await
+}
+
+/// Write UTF-8 text atomically with temp-file + rename.
+pub async fn write_text_atomic(path: &str, text: &str) -> Result<(), String> {
+    let normalized = normalize_path_for_resolution(path, false)?;
+    let now = wasip3::clocks::system_clock::now();
+    let temp_path = format!(
+        "{normalized}.tmp.{}-{}-{}",
+        now.seconds,
+        now.nanoseconds,
+        wasip3::clocks::monotonic_clock::now()
+    );
+    write_text(temp_path.as_str(), text).await?;
+    if let Err(error) = rename(temp_path.as_str(), normalized.as_str()).await {
+        let _ = remove_file_if_exists(temp_path.as_str()).await;
+        return Err(format!(
+            "failed completing atomic write to `{}`: {error}",
+            display_path(normalized.as_str())
+        ));
+    }
+    Ok(())
+}
+
+/// Rename a filesystem entry.
+pub async fn rename(old_path: &str, new_path: &str) -> Result<(), String> {
+    let old_resolved = resolve_path(old_path, false)?;
+    if old_resolved.relative_path == "." {
+        return Err(format!(
+            "source path must reference a file or directory entry: `{}`",
+            display_path(old_resolved.display_path.as_str())
+        ));
+    }
+    let new_resolved = resolve_path(new_path, false)?;
+    if new_resolved.relative_path == "." {
+        return Err(format!(
+            "destination path must reference a file or directory entry: `{}`",
+            display_path(new_resolved.display_path.as_str())
+        ));
+    }
+    old_resolved
+        .root
+        .rename_at(
+            old_resolved.relative_path.clone(),
+            &new_resolved.root,
+            new_resolved.relative_path.clone(),
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "failed renaming `{}` to `{}`: {}",
+                display_path(old_resolved.display_path.as_str()),
+                display_path(new_resolved.display_path.as_str()),
+                error.name()
+            )
+        })
+}
+
+/// Delete a non-directory file if it exists.
+pub async fn remove_file_if_exists(path: &str) -> Result<(), String> {
+    let resolved = resolve_path(path, false)?;
+    if resolved.relative_path == "." {
+        return Err(format!(
+            "path must reference a file: `{}`",
+            display_path(resolved.display_path.as_str())
+        ));
+    }
+    match resolved
+        .root
+        .unlink_file_at(resolved.relative_path.clone())
+        .await
+    {
+        Ok(()) | Err(ErrorCode::NoEntry) => Ok(()),
+        Err(error) => Err(format!(
+            "failed deleting file `{}`: {}",
+            display_path(resolved.display_path.as_str()),
+            error.name()
+        )),
+    }
+}
+
 /// List entries within a directory from guest cwd.
 pub async fn read_dir(path: &str) -> Result<Vec<DirEntry>, String> {
-    let normalized_path = normalize_dir_path(path);
-    let directory = open_directory(normalized_path).await?;
-    let entries = read_directory_entries(&directory, normalized_path).await?;
+    let normalized_path = normalize_path_for_resolution(path, true)?;
+    let directory = open_directory(normalized_path.as_str()).await?;
+    let entries = read_directory_entries(&directory, normalized_path.as_str()).await?;
     Ok(entries
         .into_iter()
         .map(|entry| DirEntry {
@@ -259,6 +448,53 @@ pub async fn read_dir(path: &str) -> Result<Vec<DirEntry>, String> {
             kind: descriptor_type_to_dir_entry_kind(entry.type_),
         })
         .collect())
+}
+
+/// Return metadata for a path, or `None` when it does not exist.
+pub async fn stat(path: &str) -> Result<Option<PathStat>, String> {
+    let resolved = resolve_path(path, true)?;
+    let descriptor_stat = if resolved.relative_path == "." {
+        resolved.root.stat().await.map_err(|error| {
+            format!(
+                "failed reading metadata for `{}`: {}",
+                display_path(resolved.display_path.as_str()),
+                error.name()
+            )
+        })?
+    } else {
+        match resolved
+            .root
+            .stat_at(PathFlags::empty(), resolved.relative_path.clone())
+            .await
+        {
+            Ok(stat) => stat,
+            Err(ErrorCode::NoEntry) => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "failed reading metadata for `{}`: {}",
+                    display_path(resolved.display_path.as_str()),
+                    error.name()
+                ));
+            }
+        }
+    };
+    Ok(Some(path_stat_from_descriptor_stat(descriptor_stat)))
+}
+
+/// Return whole-second age for a path, or `None` when age cannot be computed.
+pub async fn age_seconds(path: &str) -> Result<Option<u64>, String> {
+    let Some(stat) = stat(path).await? else {
+        return Ok(None);
+    };
+    let Some(modified_seconds) = stat.data_modification_seconds else {
+        return Ok(None);
+    };
+    let now_seconds = wasip3::clocks::system_clock::now().seconds;
+    let age_seconds = i128::from(now_seconds) - i128::from(modified_seconds);
+    if age_seconds <= 0 {
+        return Ok(Some(0));
+    }
+    Ok(Some(age_seconds as u64))
 }
 
 /// Count total line count for files matching a glob pattern recursively.
@@ -282,26 +518,87 @@ pub async fn count_lines(pattern: &str) -> Result<u64, String> {
     Ok(total)
 }
 
+struct ResolvedPath {
+    root: Descriptor,
+    relative_path: String,
+    display_path: String,
+}
+
+#[derive(Clone, Copy)]
+enum MissingFileBehavior {
+    Error,
+    ReturnNone,
+}
+
+enum OpenFileForReadOutcome {
+    Found { file: Descriptor, display_path: String },
+    Missing { display_path: String },
+}
+
+async fn open_file_for_read(
+    path: &str,
+    missing_behavior: MissingFileBehavior,
+) -> Result<OpenFileForReadOutcome, String> {
+    let resolved = resolve_path(path, false)?;
+    if resolved.relative_path == "." {
+        return Err(format!(
+            "path must reference a file: `{}`",
+            display_path(resolved.display_path.as_str())
+        ));
+    }
+    match resolved
+        .root
+        .open_at(
+            PathFlags::empty(),
+            resolved.relative_path.clone(),
+            OpenFlags::empty(),
+            DescriptorFlags::READ,
+        )
+        .await
+    {
+        Ok(file) => Ok(OpenFileForReadOutcome::Found {
+            file,
+            display_path: resolved.display_path,
+        }),
+        Err(error) => match (error, missing_behavior) {
+            (ErrorCode::NoEntry, MissingFileBehavior::ReturnNone) => {
+                Ok(OpenFileForReadOutcome::Missing {
+                    display_path: resolved.display_path,
+                })
+            }
+            (other_error, MissingFileBehavior::Error | MissingFileBehavior::ReturnNone) => {
+                Err(format!(
+                    "failed opening file `{}`: {}",
+                    display_path(resolved.display_path.as_str()),
+                    other_error.name()
+                ))
+            }
+        },
+    }
+}
+
 async fn open_directory(path: &str) -> Result<Descriptor, String> {
-    let root = select_root_preopen()?;
-    if path.is_empty() || path == "." {
-        return Ok(root);
+    let resolved = resolve_path(path, true)?;
+    if resolved.relative_path == "." {
+        return Ok(resolved.root);
     }
 
-    root.open_at(
-        PathFlags::empty(),
-        path.to_string(),
-        OpenFlags::DIRECTORY,
-        DescriptorFlags::READ,
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "failed opening directory `{}`: {}",
-            display_path(path),
-            error.name()
+    resolved
+        .root
+        .open_at(
+            PathFlags::empty(),
+            resolved.relative_path.clone(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::READ,
         )
-    })
+        .await
+        .map_err(|error| {
+            format!(
+                "failed opening directory `{}`: {}",
+                display_path(resolved.display_path.as_str()),
+                error.name()
+            )
+        })
 }
 
 async fn read_file_descriptor(file: &Descriptor, display_name: &str) -> Result<Vec<u8>, String> {
@@ -315,6 +612,36 @@ async fn read_file_descriptor(file: &Descriptor, display_name: &str) -> Result<V
         )
     })?;
     Ok(contents)
+}
+
+async fn write_file_descriptor(
+    file: &Descriptor,
+    display_name: &str,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    let (mut tx, rx) = wasip3::wit_stream::new::<u8>();
+    let (remaining, write_result) = futures::join!(
+        async move {
+            let remaining = tx.write_all(bytes).await;
+            drop(tx);
+            remaining
+        },
+        async move { file.write_via_stream(rx, 0).await }
+    );
+    if !remaining.is_empty() {
+        return Err(format!(
+            "failed writing file `{}`: {} bytes were not written",
+            display_path(display_name),
+            remaining.len()
+        ));
+    }
+    write_result.map_err(|error| {
+        format!(
+            "failed writing file `{}`: {}",
+            display_path(display_name),
+            error.name()
+        )
+    })
 }
 
 async fn read_directory_entries(
@@ -333,26 +660,114 @@ async fn read_directory_entries(
     Ok(entries)
 }
 
-fn normalize_relative_path(path: &str) -> Result<&str, String> {
+fn normalize_path_for_resolution(path: &str, allow_current_dir: bool) -> Result<String, String> {
     let path = path.trim();
-    if path.is_empty() || path == "." {
-        return Err(String::from("path must reference a file"));
-    }
     if path.starts_with('/') {
         return Err(format!(
             "absolute paths are not supported in guest fs: `{path}`"
         ));
     }
-
-    Ok(path.strip_prefix("./").unwrap_or(path))
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if path.is_empty() || path == "." {
+        if allow_current_dir {
+            return Ok(String::from("."));
+        }
+        return Err(String::from("path must reference a file"));
+    }
+    Ok(path.to_string())
 }
 
-fn normalize_dir_path(path: &str) -> &str {
-    let path = path.trim();
-    if path.is_empty() {
-        return ".";
+fn resolve_path(path: &str, allow_current_dir: bool) -> Result<ResolvedPath, String> {
+    let normalized_path = normalize_path_for_resolution(path, allow_current_dir)?;
+    let mut dot_root = None::<Descriptor>;
+    let mut fallback_root = None::<Descriptor>;
+    let mut best_match = None::<(usize, Descriptor, String)>;
+
+    for (descriptor, preopen_path) in wasip3::filesystem::preopens::get_directories() {
+        let mount = normalize_preopen_mount_path(preopen_path.as_str());
+        if mount == "." {
+            if dot_root.is_none() {
+                dot_root = Some(descriptor);
+            } else if fallback_root.is_none() {
+                fallback_root = Some(descriptor);
+            }
+            continue;
+        }
+
+        let relative = if normalized_path == mount {
+            Some(String::from("."))
+        } else {
+            normalized_path
+                .strip_prefix(mount.as_str())
+                .and_then(|remainder| remainder.strip_prefix('/'))
+                .map(|remainder| {
+                    if remainder.is_empty() {
+                        String::from(".")
+                    } else {
+                        remainder.to_string()
+                    }
+                })
+        };
+
+        if let Some(relative) = relative {
+            let mount_len = mount.len();
+            let replace = best_match
+                .as_ref()
+                .map(|(prior_mount_len, _, _)| mount_len > *prior_mount_len)
+                .unwrap_or(true);
+            if replace {
+                best_match = Some((mount_len, descriptor, relative));
+            } else if fallback_root.is_none() {
+                fallback_root = Some(descriptor);
+            }
+        } else if fallback_root.is_none() {
+            fallback_root = Some(descriptor);
+        }
     }
-    path.strip_prefix("./").unwrap_or(path)
+
+    if let Some((_mount_len, root, relative_path)) = best_match {
+        return Ok(ResolvedPath {
+            root,
+            relative_path,
+            display_path: normalized_path,
+        });
+    }
+    if let Some(root) = dot_root.or(fallback_root) {
+        return Ok(ResolvedPath {
+            root,
+            relative_path: normalized_path.clone(),
+            display_path: normalized_path,
+        });
+    }
+    Err(String::from(
+        "wasi preopens are empty; no guest filesystem root",
+    ))
+}
+
+fn normalize_preopen_mount_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return String::from(".");
+    }
+    let trimmed = trimmed.trim_start_matches("./").trim_matches('/');
+    if trimmed.is_empty() {
+        String::from(".")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn path_stat_from_descriptor_stat(stat: DescriptorStat) -> PathStat {
+    PathStat {
+        kind: descriptor_type_to_dir_entry_kind(stat.type_),
+        size: stat.size,
+        data_modification_seconds: stat
+            .data_modification_timestamp
+            .map(|timestamp| timestamp.seconds),
+        status_change_seconds: stat
+            .status_change_timestamp
+            .map(|timestamp| timestamp.seconds),
+    }
 }
 
 fn descriptor_type_to_dir_entry_kind(descriptor_type: DescriptorType) -> DirEntryKind {

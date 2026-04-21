@@ -12,6 +12,17 @@ pub mod search;
 
 pub const MITB_HOME_DIR_ENV: &str = "MITB_HOME_DIR";
 pub const MITB_ALIAS_ENV: &str = "MITB_ALIAS";
+pub const MITB_IDLE_STARTUP_GRACE_MS_ENV: &str = "MITB_IDLE_STARTUP_GRACE_MS";
+pub const MITB_IDLE_DETECTION_PARAMECIA_ENV: &str = "MITB_IDLE_DETECTION_PARAMECIA";
+pub const MITB_IDLE_TRACE_ENV: &str = "MITB_IDLE_TRACE";
+pub const MITB_APPROVAL_PROBE_CONFIRM_DELAY_MS_ENV: &str = "MITB_APPROVAL_PROBE_CONFIRM_DELAY_MS";
+const IDLE_TERMINAL_ROWS: u16 = 27;
+const IDLE_TERMINAL_COLS: u16 = 72;
+const IDLE_TRACE_CONTEXT_BYTES: usize = 48;
+#[doc(hidden)]
+pub const APPROVAL_PROBE_LOG_SCOPE: &str = "mitb_sdk::approval-probe";
+#[doc(hidden)]
+pub const DEFAULT_APPROVAL_PROBE_CONFIRM_DELAY: Duration = Duration::from_secs(1);
 
 pub mod http {
     use core::time::Duration;
@@ -407,8 +418,28 @@ pub mod build_support;
 
 #[derive(Clone, Debug, Default)]
 pub struct IdleTracker {
-    previous_contents: Option<String>,
+    previous_raw_contents: Option<String>,
+    previous_canonical_contents: Option<String>,
     startup_grace_until_ns: Option<u64>,
+    poll_count: u64,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct ApprovalProbeTracker {
+    pending_since_ns: Option<u64>,
+    confirmed_idle: bool,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalProbeOutcome {
+    NoIdle,
+    ProbeResolvedByActivity,
+    SendProbe,
+    AwaitProbeOutcome,
+    ConfirmedIdleAfterProbe,
+    ConfirmedIdle,
 }
 
 /// Return the current user's home directory from the guest environment.
@@ -454,43 +485,326 @@ fn env_value<'a>(environment: &'a [(String, String)], key: &str) -> Option<&'a s
 
 /// Default idle detection for a single policy session.
 ///
-/// Returns `true` when `contents` matches the previous value observed by the
-/// same tracker and the initial startup grace period has elapsed, then stores
-/// `contents` as the latest snapshot.
+/// Returns `true` when the latest snapshot matches the previous snapshot for
+/// this tracker and the startup grace period has elapsed.
+///
+/// Set `MITB_IDLE_DETECTION_PARAMECIA=1` to compare normalized rendered screen
+/// contents instead of raw transcript bytes.
 pub fn detect_idle(tracker: &mut IdleTracker, contents: &str) -> bool {
-    detect_idle_at(
+    let environment = wasip3::cli::environment::get_environment();
+    detect_idle_at_with_trace(
         tracker,
         contents,
         wasip3::clocks::monotonic_clock::now(),
-        duration_to_nanos_u64(Duration::from_secs(5)),
+        startup_grace_ns_from_environment(&environment),
+        idle_detection_paramecia_enabled_from_environment(&environment),
+        idle_trace_enabled_from_environment(&environment),
     )
 }
 
+fn startup_grace_ns_from_environment(environment: &[(String, String)]) -> u64 {
+    let default = duration_to_nanos_u64(Duration::from_secs(5));
+    let Some(raw_value) = env_value(environment, MITB_IDLE_STARTUP_GRACE_MS_ENV) else {
+        return default;
+    };
+
+    match raw_value.trim().parse::<u64>() {
+        Ok(milliseconds) => duration_to_nanos_u64(Duration::from_millis(milliseconds)),
+        Err(_) => default,
+    }
+}
+
+#[doc(hidden)]
+pub fn approval_probe_confirm_delay_from_environment(environment: &[(String, String)]) -> Duration {
+    let Some(raw_value) = env_value(environment, MITB_APPROVAL_PROBE_CONFIRM_DELAY_MS_ENV) else {
+        return DEFAULT_APPROVAL_PROBE_CONFIRM_DELAY;
+    };
+
+    match raw_value.trim().parse::<u64>() {
+        Ok(milliseconds) => Duration::from_millis(milliseconds),
+        Err(_) => DEFAULT_APPROVAL_PROBE_CONFIRM_DELAY,
+    }
+}
+
+#[cfg(test)]
 fn detect_idle_at(
     tracker: &mut IdleTracker,
     contents: &str,
     now_ns: u64,
     startup_grace_ns: u64,
 ) -> bool {
-    let idle = tracker
-        .previous_contents
-        .as_ref()
-        .map(|previous| previous == contents)
-        .unwrap_or(false);
-    tracker.previous_contents = Some(contents.to_string());
+    detect_idle_at_with_trace(tracker, contents, now_ns, startup_grace_ns, false, false)
+}
+
+#[cfg(test)]
+fn detect_idle_at_paramecia(
+    tracker: &mut IdleTracker,
+    contents: &str,
+    now_ns: u64,
+    startup_grace_ns: u64,
+) -> bool {
+    detect_idle_at_with_trace(tracker, contents, now_ns, startup_grace_ns, true, false)
+}
+
+fn detect_idle_at_with_trace(
+    tracker: &mut IdleTracker,
+    contents: &str,
+    now_ns: u64,
+    startup_grace_ns: u64,
+    paramecia_idle_detection: bool,
+    trace_enabled: bool,
+) -> bool {
+    tracker.poll_count = tracker.poll_count.saturating_add(1);
+    let canonical_contents = if paramecia_idle_detection || trace_enabled {
+        Some(canonicalize_terminal_snapshot(contents))
+    } else {
+        None
+    };
+    let comparison_contents = if paramecia_idle_detection {
+        canonical_contents.as_deref().unwrap_or(contents)
+    } else {
+        contents
+    };
+    let previous_raw = tracker.previous_raw_contents.as_deref();
+    let previous_canonical = tracker.previous_canonical_contents.as_deref();
+    let canonical_changed = previous_canonical
+        .zip(canonical_contents.as_deref())
+        .map(|(_, current)| previous_canonical != Some(current))
+        .unwrap_or(true);
+    let raw_changed = previous_raw
+        .map(|previous| previous != contents)
+        .unwrap_or(true);
+    let idle = if paramecia_idle_detection {
+        previous_canonical
+            .map(|previous| previous == comparison_contents)
+            .unwrap_or(false)
+    } else {
+        previous_raw
+            .map(|previous| previous == comparison_contents)
+            .unwrap_or(false)
+    };
 
     if tracker.startup_grace_until_ns.is_none() {
         tracker.startup_grace_until_ns = Some(now_ns.saturating_add(startup_grace_ns));
     }
 
-    if !idle {
-        return false;
-    }
-
-    tracker
+    let grace_ready = tracker
         .startup_grace_until_ns
         .map(|grace_until_ns| now_ns >= grace_until_ns)
-        .unwrap_or(true)
+        .unwrap_or(true);
+    let should_act = idle && grace_ready;
+
+    if trace_enabled {
+        emit_idle_trace(
+            tracker.poll_count,
+            paramecia_idle_detection,
+            raw_changed,
+            canonical_changed,
+            idle,
+            grace_ready,
+            previous_raw,
+            contents,
+            previous_canonical,
+            canonical_contents.as_deref(),
+        );
+    }
+
+    tracker.previous_raw_contents = Some(contents.to_string());
+    if let Some(ref canonical_contents) = canonical_contents {
+        tracker.previous_canonical_contents = Some(canonical_contents.clone());
+    }
+
+    should_act
+}
+
+#[doc(hidden)]
+pub fn advance_approval_probe(
+    tracker: &mut ApprovalProbeTracker,
+    idle: bool,
+    now_ns: u64,
+    confirm_delay_ns: u64,
+) -> ApprovalProbeOutcome {
+    if !idle {
+        let had_pending_probe = tracker.pending_since_ns.take().is_some();
+        tracker.confirmed_idle = false;
+        return if had_pending_probe {
+            ApprovalProbeOutcome::ProbeResolvedByActivity
+        } else {
+            ApprovalProbeOutcome::NoIdle
+        };
+    }
+
+    if tracker.confirmed_idle {
+        return ApprovalProbeOutcome::ConfirmedIdle;
+    }
+
+    if let Some(pending_since_ns) = tracker.pending_since_ns {
+        let confirm_at_ns = pending_since_ns.saturating_add(confirm_delay_ns);
+        if now_ns >= confirm_at_ns {
+            tracker.pending_since_ns = None;
+            tracker.confirmed_idle = true;
+            ApprovalProbeOutcome::ConfirmedIdleAfterProbe
+        } else {
+            ApprovalProbeOutcome::AwaitProbeOutcome
+        }
+    } else {
+        tracker.pending_since_ns = Some(now_ns);
+        ApprovalProbeOutcome::SendProbe
+    }
+}
+
+fn canonicalize_terminal_snapshot(contents: &str) -> String {
+    let mut parser = vt100::Parser::new(IDLE_TERMINAL_ROWS, IDLE_TERMINAL_COLS, 0);
+    parser.process(contents.as_bytes());
+    normalize_screen_contents(&parser.screen().contents())
+}
+
+fn normalize_screen_contents(contents: &str) -> String {
+    let mut lines: Vec<&str> = contents.lines().collect();
+    while lines
+        .last()
+        .map(|line| line.trim().is_empty())
+        .unwrap_or(false)
+    {
+        lines.pop();
+    }
+
+    lines
+        .into_iter()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn idle_trace_enabled_from_environment(environment: &[(String, String)]) -> bool {
+    env_flag_enabled(environment, MITB_IDLE_TRACE_ENV)
+}
+
+fn idle_detection_paramecia_enabled_from_environment(environment: &[(String, String)]) -> bool {
+    env_flag_enabled(environment, MITB_IDLE_DETECTION_PARAMECIA_ENV)
+}
+
+fn env_flag_enabled(environment: &[(String, String)], key: &str) -> bool {
+    let Some(raw_value) = env_value(environment, key) else {
+        return false;
+    };
+
+    matches!(
+        raw_value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "trace" | "debug"
+    )
+}
+
+fn emit_idle_trace(
+    poll_count: u64,
+    paramecia_idle_detection: bool,
+    raw_changed: bool,
+    canonical_changed: bool,
+    idle: bool,
+    grace_ready: bool,
+    previous_raw: Option<&str>,
+    current_raw: &str,
+    previous_canonical: Option<&str>,
+    current_canonical: Option<&str>,
+) {
+    eprintln!(
+        " WARN [mitb_sdk::idle-trace] poll={poll_count} mode={} raw_changed={raw_changed} canonical_changed={canonical_changed} idle={idle} grace_ready={grace_ready} raw_bytes={} canonical_bytes={}",
+        if paramecia_idle_detection {
+            "paramecia"
+        } else {
+            "default"
+        },
+        current_raw.len(),
+        current_canonical.map(str::len).unwrap_or(0),
+    );
+
+    if let Some(previous_raw) = previous_raw {
+        if let Some(summary) = diff_summary(previous_raw, current_raw) {
+            eprintln!(
+                " WARN [mitb_sdk::idle-trace] raw diff_at={} prev='{}' curr='{}' prev_bytes={} curr_bytes={}",
+                summary.byte_index,
+                summary.previous_excerpt,
+                summary.current_excerpt,
+                previous_raw.len(),
+                current_raw.len(),
+            );
+        }
+    }
+
+    if let (Some(previous_canonical), Some(current_canonical)) =
+        (previous_canonical, current_canonical)
+    {
+        if let Some(summary) = diff_summary(previous_canonical, current_canonical) {
+            eprintln!(
+                " WARN [mitb_sdk::idle-trace] canonical diff_at={} prev='{}' curr='{}' prev_bytes={} curr_bytes={}",
+                summary.byte_index,
+                summary.previous_excerpt,
+                summary.current_excerpt,
+                previous_canonical.len(),
+                current_canonical.len(),
+            );
+        } else if raw_changed {
+            eprintln!(
+                " WARN [mitb_sdk::idle-trace] raw changed but canonical matched; parser rows={} cols={}",
+                IDLE_TERMINAL_ROWS, IDLE_TERMINAL_COLS,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiffSummary {
+    byte_index: usize,
+    previous_excerpt: String,
+    current_excerpt: String,
+}
+
+fn diff_summary(previous: &str, current: &str) -> Option<DiffSummary> {
+    if previous == current {
+        return None;
+    }
+
+    let byte_index = previous
+        .bytes()
+        .zip(current.bytes())
+        .position(|(left, right)| left != right)
+        .unwrap_or(previous.len().min(current.len()));
+
+    Some(DiffSummary {
+        byte_index,
+        previous_excerpt: excerpt_around(previous, byte_index, IDLE_TRACE_CONTEXT_BYTES),
+        current_excerpt: excerpt_around(current, byte_index, IDLE_TRACE_CONTEXT_BYTES),
+    })
+}
+
+fn excerpt_around(text: &str, center: usize, radius: usize) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut start = center.saturating_sub(radius).min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+
+    let mut end = center.saturating_add(radius).min(text.len());
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut excerpt = String::new();
+    if start > 0 {
+        excerpt.push_str("...");
+    }
+    excerpt.push_str(&escape_for_log(&text[start..end]));
+    if end < text.len() {
+        excerpt.push_str("...");
+    }
+    excerpt
+}
+
+fn escape_for_log(text: &str) -> String {
+    text.chars().flat_map(char::escape_default).collect()
 }
 
 /// Logging levels used by guest-side helper utilities.
@@ -1017,6 +1331,28 @@ macro_rules! policy_guest {
 
         trait Policy: 'static + Sized + Default {
             async fn act(&mut self, contents: String) -> ActionResult;
+
+            fn detect_idle(
+                &mut self,
+                idle_tracker: &mut $crate::IdleTracker,
+                contents: &str,
+            ) -> bool {
+                $crate::detect_idle(idle_tracker, contents)
+            }
+
+            fn approval_probe_confirm_delay(&mut self) -> ::core::time::Duration {
+                $crate::approval_probe_confirm_delay_from_environment(
+                    &$bindings::wasi::cli::environment::get_environment(),
+                )
+            }
+
+            async fn on_approval_probe(&mut self, _contents: String) -> ActionResult {
+                Ok($bindings::mitb::host::types::Action::Perturb(vec![
+                    $bindings::mitb::host::types::Input::Key(
+                        $bindings::mitb::host::types::Key::Enter,
+                    ),
+                ]))
+            }
         }
 
         #[doc(hidden)]
@@ -1025,6 +1361,7 @@ macro_rules! policy_guest {
             T: Policy,
         {
             idle: $crate::IdleTracker,
+            approval_probe: $crate::ApprovalProbeTracker,
             policy: T,
         }
 
@@ -1036,6 +1373,7 @@ macro_rules! policy_guest {
                 init_logging();
                 Self {
                     idle: $crate::IdleTracker::default(),
+                    approval_probe: $crate::ApprovalProbeTracker::default(),
                     policy: T::default(),
                 }
             }
@@ -1061,12 +1399,52 @@ macro_rules! policy_guest {
 
             async fn poll(&self) -> Result<$bindings::mitb::host::types::Action, String> {
                 let contents = terminal_snapshot_text($crate::DEFAULT_TERMINAL_MAX_BYTES).await?;
+                let now_ns = $bindings::wasi::clocks::monotonic_clock::now();
                 let mut state = self.state.lock().await;
-                if !$crate::detect_idle(&mut state.idle, &contents) {
-                    return Ok($bindings::mitb::host::types::Action::Wait);
+                let __PolicySessionState {
+                    idle,
+                    approval_probe,
+                    policy,
+                } = &mut *state;
+                let idle_detected = policy.detect_idle(idle, &contents);
+                let probe_delay_ns =
+                    $crate::duration_to_nanos_u64(policy.approval_probe_confirm_delay());
+                match $crate::advance_approval_probe(
+                    approval_probe,
+                    idle_detected,
+                    now_ns,
+                    probe_delay_ns,
+                ) {
+                    $crate::ApprovalProbeOutcome::NoIdle
+                    | $crate::ApprovalProbeOutcome::AwaitProbeOutcome => {
+                        Ok($bindings::mitb::host::types::Action::Wait)
+                    }
+                    $crate::ApprovalProbeOutcome::ProbeResolvedByActivity => {
+                        let _ = log_debug(
+                            $crate::APPROVAL_PROBE_LOG_SCOPE,
+                            "approval probe outcome: activity observed; treating prior idle as gate",
+                        )
+                        .await;
+                        Ok($bindings::mitb::host::types::Action::Wait)
+                    }
+                    $crate::ApprovalProbeOutcome::SendProbe => {
+                        let _ = log_debug(
+                            $crate::APPROVAL_PROBE_LOG_SCOPE,
+                            "idle detected; sending approval probe (Enter)",
+                        )
+                        .await;
+                        policy.on_approval_probe(contents).await
+                    }
+                    $crate::ApprovalProbeOutcome::ConfirmedIdleAfterProbe => {
+                        let _ = log_debug(
+                            $crate::APPROVAL_PROBE_LOG_SCOPE,
+                            "approval probe outcome: still idle after delay; treating as true idle",
+                        )
+                        .await;
+                        policy.act(contents).await
+                    }
+                    $crate::ApprovalProbeOutcome::ConfirmedIdle => policy.act(contents).await,
                 }
-
-                state.policy.act(contents).await
             }
         }
 
@@ -1183,9 +1561,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        ExponentialBackoff, IdleTracker, LogLevel, MITB_HOME_DIR_ENV, TimeoutOutcome,
-        detect_idle_at, home_dir_from_environment, parse_log_level, pseudo_shuffle, regex_capture,
-        regex_capture_first, regex_captures, truncate, with_timeout,
+        ApprovalProbeOutcome, ApprovalProbeTracker, DEFAULT_APPROVAL_PROBE_CONFIRM_DELAY,
+        ExponentialBackoff, IdleTracker, LogLevel, MITB_APPROVAL_PROBE_CONFIRM_DELAY_MS_ENV,
+        MITB_HOME_DIR_ENV, MITB_IDLE_STARTUP_GRACE_MS_ENV, TimeoutOutcome,
+        approval_probe_confirm_delay_from_environment, detect_idle_at, detect_idle_at_paramecia,
+        home_dir_from_environment, parse_log_level, pseudo_shuffle, regex_capture,
+        regex_capture_first, regex_captures, startup_grace_ns_from_environment, truncate,
+        with_timeout,
     };
 
     #[test]
@@ -1291,6 +1673,52 @@ mod tests {
     }
 
     #[test]
+    fn approval_probe_requires_idle_after_confirm_delay() {
+        let mut tracker = ApprovalProbeTracker::default();
+        let delay_ns = Duration::from_secs(1).as_nanos() as u64;
+
+        assert_eq!(
+            super::advance_approval_probe(&mut tracker, true, 0, delay_ns),
+            ApprovalProbeOutcome::SendProbe
+        );
+        assert_eq!(
+            super::advance_approval_probe(&mut tracker, true, 500_000_000, delay_ns),
+            ApprovalProbeOutcome::AwaitProbeOutcome
+        );
+        assert_eq!(
+            super::advance_approval_probe(&mut tracker, true, 1_000_000_000, delay_ns),
+            ApprovalProbeOutcome::ConfirmedIdleAfterProbe
+        );
+        assert_eq!(
+            super::advance_approval_probe(&mut tracker, true, 1_500_000_000, delay_ns),
+            ApprovalProbeOutcome::ConfirmedIdle
+        );
+    }
+
+    #[test]
+    fn approval_probe_treats_post_probe_activity_as_gate() {
+        let mut tracker = ApprovalProbeTracker::default();
+        let delay_ns = Duration::from_secs(1).as_nanos() as u64;
+
+        assert_eq!(
+            super::advance_approval_probe(&mut tracker, true, 0, delay_ns),
+            ApprovalProbeOutcome::SendProbe
+        );
+        assert_eq!(
+            super::advance_approval_probe(&mut tracker, false, 250_000_000, delay_ns),
+            ApprovalProbeOutcome::ProbeResolvedByActivity
+        );
+        assert_eq!(
+            super::advance_approval_probe(&mut tracker, false, 500_000_000, delay_ns),
+            ApprovalProbeOutcome::NoIdle
+        );
+        assert_eq!(
+            super::advance_approval_probe(&mut tracker, true, 1_000_000_000, delay_ns),
+            ApprovalProbeOutcome::SendProbe
+        );
+    }
+
+    #[test]
     fn detect_idle_tracks_each_guest_type() {
         let mut first = IdleTracker::default();
         let mut second = IdleTracker::default();
@@ -1327,6 +1755,67 @@ mod tests {
             "same",
             5_000_000_010,
             5_000_000_000,
+        ));
+    }
+
+    #[test]
+    fn detect_idle_uses_rendered_screen_contents() {
+        let mut tracker = IdleTracker::default();
+        let first = "\x1b[2J\x1b[1;1Hhello";
+        let repaint_with_cursor_move = "\x1b[2J\x1b[1;1Hhello\x1b[1;1Hhello\x1b[1;6H";
+
+        assert!(!detect_idle_at_paramecia(&mut tracker, first, 0, 0));
+        assert!(detect_idle_at_paramecia(
+            &mut tracker,
+            repaint_with_cursor_move,
+            1,
+            0
+        ));
+    }
+
+    #[test]
+    fn default_idle_detection_uses_raw_contents() {
+        let mut tracker = IdleTracker::default();
+        let first = "\x1b[2J\x1b[1;1Hhello";
+        let repaint_with_cursor_move = "\x1b[2J\x1b[1;1Hhello\x1b[1;1Hhello\x1b[1;6H";
+
+        assert!(!detect_idle_at(&mut tracker, first, 0, 0));
+        assert!(!detect_idle_at(
+            &mut tracker,
+            repaint_with_cursor_move,
+            1,
+            0
+        ));
+    }
+
+    #[test]
+    fn mode_switch_does_not_break_idle_detection() {
+        let mut tracker = IdleTracker::default();
+        let content = "hello";
+        let now = Duration::from_secs(10).as_nanos() as u64;
+        let grace = Duration::from_secs(5).as_nanos() as u64;
+
+        // First poll in default mode establishes baseline
+        assert!(!detect_idle_at(&mut tracker, content, 0, grace));
+
+        // Now switch to paramecia mode - first poll after switch
+        // should correctly detect non-idle (no previous canonical yet)
+        assert!(!detect_idle_at_paramecia(&mut tracker, content, now, grace));
+
+        // Second paramecia poll - should detect idle (same rendered screen)
+        assert!(detect_idle_at_paramecia(
+            &mut tracker,
+            content,
+            now + 1_000_000_000,
+            grace
+        ));
+
+        // Switch back to default mode - should detect idle (same raw content)
+        assert!(detect_idle_at(
+            &mut tracker,
+            content,
+            now + 2_000_000_000,
+            grace
         ));
     }
 
@@ -1384,6 +1873,74 @@ mod tests {
         let environment = vec![("HOME".to_string(), String::new())];
 
         assert!(home_dir_from_environment(&environment).is_err());
+    }
+
+    #[test]
+    fn startup_grace_defaults_to_five_seconds_when_missing() {
+        assert_eq!(
+            startup_grace_ns_from_environment(&[]),
+            Duration::from_secs(5).as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn startup_grace_uses_env_override_in_milliseconds() {
+        let environment = vec![(
+            MITB_IDLE_STARTUP_GRACE_MS_ENV.to_string(),
+            "1500".to_string(),
+        )];
+
+        assert_eq!(
+            startup_grace_ns_from_environment(&environment),
+            Duration::from_millis(1500).as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn startup_grace_falls_back_to_default_when_invalid() {
+        let environment = vec![(
+            MITB_IDLE_STARTUP_GRACE_MS_ENV.to_string(),
+            "invalid".to_string(),
+        )];
+
+        assert_eq!(
+            startup_grace_ns_from_environment(&environment),
+            Duration::from_secs(5).as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn approval_probe_confirm_delay_defaults_to_one_second_when_missing() {
+        assert_eq!(
+            approval_probe_confirm_delay_from_environment(&[]),
+            DEFAULT_APPROVAL_PROBE_CONFIRM_DELAY
+        );
+    }
+
+    #[test]
+    fn approval_probe_confirm_delay_uses_env_override_in_milliseconds() {
+        let environment = vec![(
+            MITB_APPROVAL_PROBE_CONFIRM_DELAY_MS_ENV.to_string(),
+            "1500".to_string(),
+        )];
+
+        assert_eq!(
+            approval_probe_confirm_delay_from_environment(&environment),
+            Duration::from_millis(1500)
+        );
+    }
+
+    #[test]
+    fn approval_probe_confirm_delay_falls_back_to_default_when_invalid() {
+        let environment = vec![(
+            MITB_APPROVAL_PROBE_CONFIRM_DELAY_MS_ENV.to_string(),
+            "invalid".to_string(),
+        )];
+
+        assert_eq!(
+            approval_probe_confirm_delay_from_environment(&environment),
+            DEFAULT_APPROVAL_PROBE_CONFIRM_DELAY
+        );
     }
 
     #[test]

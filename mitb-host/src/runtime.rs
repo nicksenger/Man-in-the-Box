@@ -27,7 +27,7 @@ pub(crate) async fn run(options: HostOptions) -> Result<(), HostError> {
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let report_store = ReportStore::new();
     let transcript = Arc::new(Mutex::new(TranscriptBuffer::default()));
-    let mut agent_runtime = options.agent.clone().map(|agent_options| {
+    let mut agent_runtime = options.agent.map(|agent_options| {
         agent::spawn(
             agent_options,
             report_store.clone(),
@@ -53,7 +53,14 @@ pub(crate) async fn run(options: HostOptions) -> Result<(), HostError> {
             Ok::<wasmtime::component::ResourceAny, wasmtime::Error>(session)
         })
         .await??;
-    let pty = PtySession::spawn(&options, transcript)?;
+    let pty = PtySession::spawn(
+        options.command,
+        options.command_args,
+        Arc::clone(&transcript),
+        options.max_transcript_bytes,
+        options.event_sender.clone(),
+        options.keyboard_rx.expect("keyboard_rx must be set"),
+    )?;
 
     let mut ticker = tokio::time::interval(options.poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -163,6 +170,26 @@ async fn instantiate_policy(
         let cwd = std::env::current_dir()?;
         info!(cwd = %cwd.display(), "preopening guest cwd for WASI filesystem access");
         wasi.preopened_dir(&cwd, ".", DirPerms::all(), FilePerms::all())?;
+        if let Some(shared_root) = host_shared_root_dir() {
+            std::fs::create_dir_all(&shared_root)?;
+            let shared_root_env_value = shared_root.to_string_lossy().into_owned();
+            info!(
+                host_path = %shared_root.display(),
+                guest_path = MITB_SHARED_ROOT_GUEST_PATH,
+                "preopening shared guest directory for cross-worktree coordination"
+            );
+            wasi.preopened_dir(
+                &shared_root,
+                MITB_SHARED_ROOT_GUEST_PATH,
+                DirPerms::all(),
+                FilePerms::all(),
+            )?;
+            wasi.env(MITB_SHARED_ROOT_ENV, shared_root_env_value.as_str());
+        } else {
+            warn!(
+                "host home directory unavailable; shared coordination directory was not preopened"
+            );
+        }
     }
     let wasi = wasi.build();
     let state = StoreState {

@@ -29,6 +29,7 @@ members = [
     "mitb-pake",
     "mitb-server",
     "mitb-sdk",
+    "mitb-mcp",
     "mitb-wit",
 ]
 exclude = ["mitb-examples/*"]

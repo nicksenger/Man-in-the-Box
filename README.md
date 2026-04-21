@@ -62,6 +62,23 @@ MITB_SERVER_ADDR=wss://mitb.nsenger.com/ws MITB_SECRET_CODE=lobby \
   mitb /path/to/my/policy.wasm claude
 ```
 
+### Timing Overrides
+
+Use environment variables to tune default interaction pacing:
+
+- `MITB_IDLE_STARTUP_GRACE_MS`: startup idle grace period before policy actions (default `5000` ms).
+- `MITB_APPROVAL_PROBE_CONFIRM_DELAY_MS`: how long to wait after sending the approval probe Enter key before treating the session as truly idle (default `1000` ms).
+- `MITB_ENTER_DELAY_AFTER_TEXT_MS`: delay between sending text input and sending `Enter` (default `700` ms).
+
+Example:
+
+```bash
+MITB_IDLE_STARTUP_GRACE_MS=1000 \
+MITB_APPROVAL_PROBE_CONFIRM_DELAY_MS=1500 \
+MITB_ENTER_DELAY_AFTER_TEXT_MS=150 \
+  mitb /path/to/my/policy.wasm claude
+```
+
 ## Policy Definition
 
 A `mitb` policy is a WASM component that observes terminal (PTY) state and decides what to do next:
@@ -106,8 +123,12 @@ impl Default for NumberGame {
 
 impl Policy for NumberGame {
     // This method is called whenever the agent is determined to be idle.
-    // For control over idle-detection, the `GuestSession` trait may
-    // be implemented directly.
+    // Before calling `act`, the SDK sends an Enter "approval probe" and
+    // waits for `approval_probe_confirm_delay` (default: 1 second). If
+    // the terminal still appears idle after that delay, it is treated as
+    // truly idle and `act` runs.
+    // Override `detect_idle`, `approval_probe_confirm_delay`, or
+    // `on_approval_probe` to customize this behavior.
     async fn act(&mut self, pty_contents: String) -> ActionResult {
         match &mut self.state {
             // When the agent first starts, we introduce the game.

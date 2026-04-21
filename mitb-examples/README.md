@@ -7,6 +7,7 @@ Standalone policy examples for `mitb`.
 - `always-wait`: never sends input, always returns `wait`.
 - `number-game`: plays a number guessing game via `<guess>...</guess>` tags.
 - `maintainability`: scores Rust maintainability and explores commits with MCTS.
+- `git-responder`: addresses unresolved Git MR/PR comments.
 
 ## Build
 

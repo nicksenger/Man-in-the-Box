@@ -269,7 +269,9 @@ fn main() -> Result<(), CliError> {
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown = Arc::new(AtomicBool::new(false));
+    let (keyboard_tx, keyboard_rx) = std::sync::mpsc::channel();
     host_options.event_sender = Some(event_tx);
+    host_options.keyboard_rx = Some(keyboard_rx);
     host_options.shutdown = Some(Arc::clone(&shutdown));
 
     debug!("starting host thread and box UI");
@@ -279,6 +281,7 @@ fn main() -> Result<(), CliError> {
         event_rx,
         mitb_box::RunOptions {
             mute_audio: options.mute,
+            keyboard_tx: Some(keyboard_tx),
         },
     );
     shutdown.store(true, Ordering::Relaxed);

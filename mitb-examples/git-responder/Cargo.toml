@@ -1,0 +1,18 @@
+[package]
+name = "git-responder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wit-bindgen.workspace = true
+mitb-sdk.workspace = true
+serde_json = "1.0.145"
+uuid = { version = "1.23.1", default-features = false, features = ["v5", "std"] }
+
+[build-dependencies]
+mitb-sdk = { workspace = true, features = ["build-support"] }
+
+[lib]
+crate-type = ["cdylib"]
